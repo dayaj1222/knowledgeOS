@@ -1,0 +1,24 @@
+[project]
+name = "knowledge-base"
+version = "0.1.0"
+description = "Local-first study companion: library, AI tutor chat, quizzes with AI grading, proficiency tracking, and study plans."
+readme = "README.md"
+authors = []
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.141.1",
+    "sqlalchemy>=2.0.52",
+    "uvicorn[standard]>=0.52.4",
+    "email-validator>=2.0.0",
+    "python-multipart>=0.0.32",
+    "httpx>=0.28.1",
+    "pydantic-ai>=2.40.0",
+]
+
+[tool.uv.build-backend]
+module-name = "app"
+module-root = ""
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"

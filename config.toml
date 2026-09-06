@@ -1,0 +1,18 @@
+# knowledge-base configuration — source of truth for tunables.
+
+[llm]
+base_url = "http://127.0.0.1:9173/v1"
+model = "EXPERT"
+
+[agent]
+# How many passages to send the LLM per tagging call. Smaller = more reliable
+# per-call output (models skip/hallucinate on long structured returns), larger
+# = fewer round-trips. Batching merges results across calls.
+tag_batch_size = 5
+# Send tagging batches sequentially (safer, respects the proxy rate gate).
+tag_parallel = false
+
+[ingest]
+chunk_tokens = 800
+overlap_tokens = 100
+max_upload_mb = 50
