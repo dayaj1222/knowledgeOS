@@ -115,7 +115,20 @@ export function useChatThread() {
       };
       const userMsg: ChatMessage = { id: -Date.now(), role: "user", content: msg };
       setMessages((m) => {
-        const next = [...m, userMsg];
+        // Mirror the server: this answer closes the most recent still-open
+        // clarify card (server stamps it on arrival; reload wins on conflict).
+        let lastOpen = -1;
+        m.forEach((x, i) => {
+          if (x.role !== "clarify") return;
+          const a = (x.tool_calls?.[0]?.args ?? {}) as { completed?: boolean };
+          if (!a.completed) lastOpen = i;
+        });
+        const stamped = lastOpen === -1 ? m : m.map((x, i) => {
+          if (i !== lastOpen) return x;
+          const a = (x.tool_calls?.[0]?.args ?? {}) as Record<string, unknown>;
+          return { ...x, tool_calls: [{ tool: "clarify", args: { ...a, completed: true, answer: msg } }] };
+        });
+        const next = [...stamped, userMsg];
         if (activeConversationId != null) writeCache(LS_MSGS(activeConversationId), next);
         return next;
       });
@@ -166,6 +179,23 @@ export function useChatThread() {
           setMessages((m) => {
             if (m.some((x) => x.id === quizMsg.id)) return m;
             const next = [...m, quizMsg];
+            writeCache(LS_MSGS(turn.conversation_id), next);
+            return next;
+          });
+        }
+        // Inline clarify: a disambiguating question — tappable options plus
+        // optional free text (role="clarify", same persistence pattern).
+        if (turn.clarify) {
+          const clarifyMsg: ChatMessage = {
+            id: turn.clarify.message_id,
+            role: "clarify",
+            content: "",
+            tool_calls: [{ tool: "clarify", args: turn.clarify }],
+            created_at: new Date().toISOString(),
+          };
+          setMessages((m) => {
+            if (m.some((x) => x.id === clarifyMsg.id)) return m;
+            const next = [...m, clarifyMsg];
             writeCache(LS_MSGS(turn.conversation_id), next);
             return next;
           });

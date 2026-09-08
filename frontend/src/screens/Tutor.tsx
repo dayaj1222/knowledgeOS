@@ -4,6 +4,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowDown,
   Check,
   Copy,
   Plus,
@@ -27,6 +28,7 @@ import { notifyError, notifySuccess } from "../components/notifications";
 import { useChatThread, dropThreadCache } from "../components/useChatThread";
 import Markdown from "../components/Markdown";
 import InlineQuiz from "../components/InlineQuiz";
+import InlineClarify from "../components/InlineClarify";
 import ToolCalls from "../components/ToolCalls";
 import ChatComposer from "../components/ChatComposer";
 
@@ -63,6 +65,11 @@ export default function Tutor() {
   const [copiedId, setCopiedId] = useState<number | null>(null);
   const [historyPopupOpen, setHistoryPopupOpen] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // Stick-to-bottom: follow only while pinned to the absolute bottom.
+  // Any scroll-up unpins, so streaming never yanks away reading.
+  const stickRef = useRef(true);
+  const [atBottom, setAtBottom] = useState(true);
 
   const activeTitle = conversations.find((c) => c.id === activeConversationId)?.title;
 
@@ -84,11 +91,41 @@ export default function Tutor() {
     : conversations;
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    // Follow only while pinned to the absolute bottom. Direct scrollTop
+    // (not smooth scrollIntoView) so per-token streaming can't queue up
+    // animations that drag the view after the user scrolled away.
+    if (!stickRef.current) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    else bottomRef.current?.scrollIntoView({ behavior: "auto" });
   }, [messages, busy, streamText]);
+
+  // New conversation → start pinned to the bottom again.
+  useEffect(() => {
+    stickRef.current = true;
+    setAtBottom(true);
+  }, [activeConversationId]);
+
+  function onScroll(e: React.UIEvent<HTMLDivElement>) {
+    // Absolute bottom: pinned only when truly at the end (≤4px slack).
+    const el = e.currentTarget;
+    const pinned = el.scrollHeight - el.scrollTop - el.clientHeight <= 4;
+    stickRef.current = pinned;
+    setAtBottom((prev) => (prev === pinned ? prev : pinned));
+  }
+
+  function jumpToLatest() {
+    stickRef.current = true;
+    setAtBottom(true);
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    else bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }
 
   async function send(text: string) {
     if (!text.trim() || busy) return;
+    stickRef.current = true; // own message → follow the reply
+    setAtBottom(true);
     const cmd = text.trim().toLowerCase();
     if (cmd === "/history") {
       setHistoryPopupOpen(true);
@@ -164,7 +201,7 @@ export default function Tutor() {
   return (
     <div className="flex gap-4 items-start animate-fadeIn h-[calc(100vh-3.5rem)]">
       {/* Main thread */}
-      <div className="flex-1 rounded-xl bg-card border border-border flex flex-col h-full overflow-hidden min-w-0">
+      <div className="flex-1 rounded-xl bg-card border border-border flex flex-col h-full overflow-hidden min-w-0 relative">
         <div className="flex items-center gap-2 px-5 py-3.5 border-b border-border">
           <Sparkles size={16} className="text-accent shrink-0" />
           <h1 className="text-sm font-semibold text-foreground truncate">
@@ -183,7 +220,7 @@ export default function Tutor() {
 
         <div className="relative flex-1 overflow-hidden">
           <div className="pointer-events-none absolute top-0 inset-x-0 h-6 bg-gradient-to-b from-card to-transparent z-10" />
-          <div className="flex-1 overflow-y-auto px-5 py-4 space-y-6 w-full mx-auto h-full">
+          <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-5 py-4 space-y-6 w-full mx-auto h-full">
           {messages.length === 0 && (
             <div className="py-10 text-center space-y-5">
               <div>
@@ -216,6 +253,16 @@ export default function Tutor() {
                     message={m}
                     conversationId={activeConversationId ?? 0}
                     onFinish={submitQuiz}
+                  />
+                </div>
+              </div>
+            ) : m.role === "clarify" ? (
+              <div key={m.id} className="flex justify-start">
+                <div className="w-full max-w-[92%] rounded-2xl rounded-bl-sm px-4 py-3 shadow-sm bg-muted border border-border">
+                  <InlineClarify
+                    message={m}
+                    busy={busy}
+                    onAnswer={(a) => send(a)}
                   />
                 </div>
               </div>
@@ -286,6 +333,15 @@ export default function Tutor() {
           <div ref={bottomRef} />
           </div>
         </div>
+
+        {!atBottom && (
+          <button
+            onClick={jumpToLatest}
+            className="absolute bottom-24 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 text-xs font-semibold px-3.5 py-2 rounded-full bg-primary text-white shadow-lg hover:opacity-90 transition-opacity"
+          >
+            <ArrowDown size={13} /> Latest
+          </button>
+        )}
 
         <ChatComposer busy={busy} onSend={send} />
       </div>

@@ -4,16 +4,21 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { MessageSquare, Plus, Send, X } from "lucide-react";
+import { ArrowDown, MessageSquare, Plus, Send, X } from "lucide-react";
 import { useStore } from "../store";
 import { useChatThread } from "./useChatThread";
 import Markdown from "./Markdown";
 import ToolCalls from "./ToolCalls";
+import InlineClarify from "./InlineClarify";
 
 export default function ChatPanel() {
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // Stick-to-bottom: follow only while pinned to the absolute bottom.
+  const stickRef = useRef(true);
+  const [atBottom, setAtBottom] = useState(true);
   const location = useLocation();
   const navigate = useNavigate();
   const { setActiveConversationId } = useStore();
@@ -28,11 +33,32 @@ export default function ChatPanel() {
   const hidden = location.pathname === "/tutor";
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (!stickRef.current) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    else bottomRef.current?.scrollIntoView({ behavior: "auto" });
   }, [messages, busy, streamText, open]);
+
+  function onScroll(e: React.UIEvent<HTMLDivElement>) {
+    // Absolute bottom: pinned only when truly at the end (≤4px slack).
+    const el = e.currentTarget;
+    const pinned = el.scrollHeight - el.scrollTop - el.clientHeight <= 4;
+    stickRef.current = pinned;
+    setAtBottom((prev) => (prev === pinned ? prev : pinned));
+  }
+
+  function jumpToLatest() {
+    stickRef.current = true;
+    setAtBottom(true);
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    else bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }
 
   async function send(text: string) {
     if (!text.trim() || busy) return;
+    stickRef.current = true; // own message → follow the reply
+    setAtBottom(true);
     setInput("");
     await sendStream(text);
   }
@@ -50,7 +76,7 @@ export default function ChatPanel() {
       </button>
 
       {open && (
-        <div className="fixed top-0 right-0 bottom-0 z-40 w-full max-w-[400px] bg-card border-l border-border shadow-xl flex flex-col animate-fadeIn">
+        <div className="fixed top-0 right-0 bottom-0 z-40 w-full max-w-[400px] bg-card border-l border-border shadow-xl flex flex-col animate-fadeIn relative">
           <div className="flex items-center gap-2 px-4 py-3 border-b border-border">
             <span className="text-sm font-semibold text-foreground">Tutor</span>
             <div className="ml-auto flex items-center gap-1.5">
@@ -71,13 +97,20 @@ export default function ChatPanel() {
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
+          <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
             {messages.length === 0 && !busy && (
               <p className="text-xs text-muted-foreground text-center py-8">
                 Ask about your material, request a quiz, or say "plan my week".
               </p>
             )}
             {messages.map((m) => (
+              m.role === "clarify" ? (
+                <div key={m.id} className="flex justify-start">
+                  <div className="max-w-[85%] rounded-xl px-3 py-2 bg-muted/70 border border-border/60">
+                    <InlineClarify message={m} busy={busy} onAnswer={(a) => send(a)} />
+                  </div>
+                </div>
+              ) : (
               <div key={m.id} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
                 <div
                   className={`max-w-[85%] rounded-xl px-3 py-2 text-[13px] leading-relaxed ${
@@ -94,6 +127,7 @@ export default function ChatPanel() {
                   <ToolCalls calls={m.tool_calls ?? []} />
                 </div>
               </div>
+              )
             ))}
             {busy && streamText && (
               <div className="flex justify-start">
@@ -110,6 +144,15 @@ export default function ChatPanel() {
             )}
             <div ref={bottomRef} />
           </div>
+
+          {!atBottom && (
+            <button
+              onClick={jumpToLatest}
+              className="absolute bottom-20 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1 text-[11px] font-semibold px-3 py-1.5 rounded-full bg-primary text-white shadow-lg hover:opacity-90 transition-opacity"
+            >
+              <ArrowDown size={12} /> Latest
+            </button>
+          )}
 
           <form
             onSubmit={(e) => {

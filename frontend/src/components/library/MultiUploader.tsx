@@ -3,6 +3,7 @@
 
 import { useCallback, useRef, useState } from "react";
 import { Upload, X, FileText, CheckCircle2, AlertCircle, Loader2 } from "lucide-react";
+import { notifyError } from "../notifications";
 
 type FileType = "pdf" | "slides" | "notes";
 
@@ -61,9 +62,11 @@ export function MultiUploader({
           await onUpload([{ file: item.file, name: item.name, type: item.type, moduleId: item.moduleId }]);
           setQueue((prev) => prev.map((q) => (q.id === item.id ? { ...q, status: "done" } : q)));
         } catch (err) {
+          const detail = (err as Error).message;
+          notifyError(`${item.name}: ${detail}`);
           setQueue((prev) =>
             prev.map((q) =>
-              q.id === item.id ? { ...q, status: "failed", error: (err as Error).message } : q
+              q.id === item.id ? { ...q, status: "failed", error: detail } : q
             )
           );
         }

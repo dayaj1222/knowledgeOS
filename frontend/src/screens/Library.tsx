@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { useStore, useSelectedCourse } from "../store";
 import { EmptyState } from "../components/indicators";
+import { notifyError, notifySuccess } from "../components/notifications";
 import { Spinner } from "../hooks";
 import { CourseListItem } from "../components/library/CourseListItem";
 import { ModuleList } from "../components/library/ModuleList";
@@ -330,19 +331,17 @@ function SyllabusUpload({
 }) {
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     if (!file) return;
     setBusy(true);
-    setMsg(null);
     try {
       await onUpload(courseId, file);
-      setMsg("Syllabus parsed into modules and topics.");
+      notifySuccess("Syllabus parsed into modules and topics.");
       setFile(null);
     } catch (err) {
-      setMsg(`Failed: ${(err as Error).message}`);
+      notifyError((err as Error).message);
     } finally {
       setBusy(false);
     }
@@ -369,17 +368,6 @@ function SyllabusUpload({
           <BookOpen size={13} />
           {busy ? "Parsing…" : file ? `Build tree from ${file.name}` : "Select syllabus PDF"}
         </button>
-        {msg && (
-          <div
-            className={`p-2 rounded-lg text-xs ${
-              msg.startsWith("Failed")
-                ? "bg-rose-950/40 text-rose-300 border border-rose-800/40"
-                : "bg-emerald-950/40 text-emerald-300 border border-emerald-800/40"
-            }`}
-          >
-            {msg}
-          </div>
-        )}
       </form>
     </div>
   );

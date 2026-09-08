@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import {
   Save,
   Check,
-  X,
   Sliders,
   Clock,
   Target,
@@ -11,8 +10,9 @@ import {
   Sun,
   Moon,
 } from "lucide-react";
-import { Spinner, useFetch } from "../hooks";
+import { Spinner, useFetch, useToastError } from "../hooks";
 import { getPreference, putPreference, USER_ID } from "../api";
+import { notifyError } from "../components/notifications";
 import ThemeToggle from "../components/ThemeToggle";
 
 interface FormState {
@@ -31,6 +31,7 @@ const EMPTY: FormState = {
 
 export default function Settings() {
   const { data: pref, error, loading } = useFetch(() => getPreference(USER_ID));
+  useToastError(error);
 
   const [form, setForm] = useState<FormState>(EMPTY);
   const [saving, setSaving] = useState(false);
@@ -67,7 +68,7 @@ export default function Settings() {
         (sessionLength != null && Number.isNaN(sessionLength)) ||
         (dailyGoal != null && Number.isNaN(dailyGoal))
       ) {
-        setSaved({ ok: false, message: "Session length and daily goal must be valid numbers" });
+        notifyError("Session length and daily goal must be valid numbers");
         return;
       }
 
@@ -80,7 +81,7 @@ export default function Settings() {
       setSaved({ ok: true, message: "Study preferences saved successfully" });
       setTimeout(() => setSaved(null), 4000);
     } catch (e) {
-      setSaved({ ok: false, message: `Failed: ${(e as Error).message}` });
+      notifyError((e as Error).message);
     } finally {
       setSaving(false);
     }
@@ -104,11 +105,6 @@ export default function Settings() {
       </div>
 
       {loading && <Spinner />}
-      {error && (
-        <div className="p-4 rounded-xl bg-rose-950/40 border border-rose-800/40 text-rose-300 text-sm">
-          Error loading profile: {error}
-        </div>
-      )}
 
       {!loading && !error && (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-start">
@@ -221,14 +217,8 @@ export default function Settings() {
               </button>
 
               {saved && (
-                <div
-                  className={`flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg ${
-                    saved.ok
-                      ? "bg-emerald-950/40 text-emerald-300 border border-emerald-800/40"
-                      : "bg-rose-950/40 text-rose-300 border border-rose-800/40"
-                  }`}
-                >
-                  {saved.ok ? <Check size={14} /> : <X size={14} />}
+                <div className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg bg-emerald-950/40 text-emerald-300 border border-emerald-800/40">
+                  <Check size={14} />
                   {saved.message}
                 </div>
               )}

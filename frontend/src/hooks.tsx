@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { notifyError } from "./components/notifications";
 
 export function useFetch<T>(fn: () => Promise<T>) {
   const [data, setData] = useState<T | null>(null);
@@ -23,6 +24,22 @@ export function useFetch<T>(fn: () => Promise<T>) {
   }, [load]); // fetch on mount + whenever the fn identity changes
 
   return { data, error, loading, reload: load };
+}
+
+/**
+ * App-wide error rule: failures surface through the notification system,
+ * never as raw inline text. Call with a fetch error string — it toasts once
+ * per distinct message and resets when the error clears.
+ */
+export function useToastError(message: string | null) {
+  const last = useRef<string | null>(null);
+  useEffect(() => {
+    if (message && message !== last.current) {
+      last.current = message;
+      notifyError(message);
+    }
+    if (!message) last.current = null;
+  }, [message]);
 }
 
 export function Spinner() {

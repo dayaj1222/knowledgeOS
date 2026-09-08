@@ -388,6 +388,7 @@ export interface ChatTurn {
   tool_calls: ToolCall[];
   ui_actions: UiAction[];
   quiz?: InlineQuizPayload | null;
+  clarify?: InlineClarifyPayload | null;
 }
 
 export interface QuizQuestion {
@@ -402,6 +403,15 @@ export interface InlineQuizPayload {
   message_id: number;
   assessment_id: number;
   questions: QuizQuestion[];
+}
+
+export interface InlineClarifyPayload {
+  message_id: number;
+  question: string;
+  options: string[];
+  allow_free_text: boolean;
+  completed?: boolean;
+  answer?: string | null;
 }
 
 export interface Conversation {
@@ -491,6 +501,7 @@ export async function sendChatStream(
           tool_calls: (data.tool_calls as ToolCall[]) ?? [],
           ui_actions: (data.ui_actions as UiAction[]) ?? [],
           quiz: (data.quiz as InlineQuizPayload | null) ?? null,
+          clarify: (data.clarify as InlineClarifyPayload | null) ?? null,
         };
       } else if (event === "error") {
         throw new Error(String(data.error ?? "stream error"));

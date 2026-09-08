@@ -11,7 +11,9 @@ layer directly — tutor behavior never duplicates app logic.
 Mutation rule (confirm-in-chat): mutating tools take `confirmed: bool = False`.
 With confirmed=False they do NOTHING except return a plain-language proposal
 the tutor shows the user. Only after the user says yes does the tutor re-call
-with confirmed=True. Memory writes (`remember`) and `ui_command` are exempt.
+with confirmed=True. Memory writes (`remember`), background learning writes
+(`record_understanding`), read-only questions (`ask_clarify`), and
+`ui_command` are exempt.
 
 Per-turn context (Learner Snapshot) is prepended every turn: weakest topics,
 SM-2 items due, recent quiz average, upcoming deadlines — so the tutor
@@ -59,6 +61,7 @@ def build_snapshot(db, user_id: int) -> str:
         weak.append(f"{topic.name if topic else r.topic_id} ({r.score:.2f})")
 
     due = ReviewService.due_queue(db, user_id, limit=5)
+    due_names = [d.get("topic_name", f"Topic #{d.get('topic_id')}") for d in due]
     avg = db.scalar(
         select(func.avg(models.Attempt.score)).where(
             models.Attempt.user_id == user_id,
@@ -77,16 +80,43 @@ def build_snapshot(db, user_id: int) -> str:
     return (
         f"Library: {n_courses} course(s), {n_topics} topic(s) total | "
         f"Weakest topics: {', '.join(weak) or '(no scores yet)'} | "
-        f"Reviews due: {len(due)} ({', '.join(t.name for t in due[:3]) or 'none'}) | "
+        f"Reviews due: {len(due)} ({', '.join(due_names[:3]) or 'none'}) | "
         f"Recent quiz avg: {(avg or 0):.2f} | "
         f"Deadlines: {', '.join(f'{d.title} ({d.due_date})' for d in upcoming) or 'none'} | "
         f"Notes: {'; '.join(f'{m.key}: {m.value}' for m in mems) or 'none'}"
     )
 
 
+def _thread_id(user_id: int, conversation_id: int) -> str:
+    """Stable server-side thread per tutor conversation.
+
+    The DeepSeek proxy keys its web conversation off this id and keeps
+    history server-side, so each turn sends only the delta (new user/tool
+    messages) instead of spawning a fresh conversation per turn.
+    """
+    return f"tutor_u{user_id}_c{conversation_id}"
+
+
+def _stable_system(custom: str) -> str:
+    """System prompt that is IDENTICAL every turn of a conversation.
+
+    Per-turn state (learner snapshot, UI state) rides on the latest user
+    message instead — the proxy only forwards the system block on the
+    first exchange and appends deltas after that.
+    """
+    return f"{TUTOR_PROMPT}{custom}"
+
+
 def _open_turn(db, user_id: int, conversation_id: int | None, message: str,
                ui_context: dict | None = None):
-    """Get/create conversation, persist the user message, build the prompt."""
+    """Get/create conversation, persist the user message, build the prompt.
+
+    Returns (conversation_id, messages, thread_id) where messages are
+    proper OpenAI roles: one stable system + the recent history as
+    alternating user/assistant turns, ending with the new user turn that
+    carries the fresh snapshot/UI state. History itself is never rewritten
+    — new turns only append.
+    """
     if conversation_id is None:
         conv = models.Conversation(user_id=user_id, title=message[:60] or "Tutor chat")
         db.add(conv)
@@ -101,17 +131,21 @@ def _open_turn(db, user_id: int, conversation_id: int | None, message: str,
     db.add(models.ChatMessage(conversation_id=conversation_id, role="user", content=message))
     db.commit()
 
+    _stamp_clarify_answered(db, conversation_id, message)
+
     history = db.scalars(
         select(models.ChatMessage)
         .where(models.ChatMessage.conversation_id == conversation_id)
         .order_by(models.ChatMessage.id.desc())
-        .limit(20)
+        .limit(30)
     ).all()
-    transcript = "\n".join(
-        f"{'Student' if m.role == 'user' else 'Tutor'}: {m.content}"
-        for m in reversed(history)
-        if m.role in ("user", "assistant")  # quiz cards render inline; not LLM text
-    )
+    # Oldest-first, user/assistant only (quiz/clarify cards render inline).
+    ordered = list(reversed(history))
+    # Exclude the just-persisted message from the history prefix; it is
+    # re-attached below with the fresh snapshot attached.
+    ordered = [m for m in ordered if m.role in ("user", "assistant")]
+    prior = ordered[:-1]
+    messages: list[dict] = []
     snapshot = build_snapshot(db, user_id)
     pref = db.get(models.Preference, user_id)
     custom = (
@@ -119,11 +153,49 @@ def _open_turn(db, user_id: int, conversation_id: int | None, message: str,
         if pref and pref.tutor_instructions and pref.tutor_instructions.strip()
         else ""
     )
-    messages = [
-        {"role": "system", "content": f"{TUTOR_PROMPT}{custom}\n\nLEARNER SNAPSHOT: {snapshot}{_ui_state_line(ui_context)}"},
-        {"role": "user", "content": f"CONVERSATION SO FAR:\n{transcript}\n\nRespond to the last student message."},
-    ]
-    return conversation_id, messages
+    messages.append({"role": "system", "content": _stable_system(custom)})
+    for m in prior[-20:]:
+        messages.append({
+            "role": m.role,
+            "content": m.content,
+        })
+    context_line = f"LEARNER SNAPSHOT: {snapshot}{_ui_state_line(ui_context)}"
+    messages.append({
+        "role": "user",
+        "content": f"{context_line}\n\n{message}",
+    })
+    return conversation_id, messages, _thread_id(user_id, conversation_id)
+
+
+def _stamp_clarify_answered(db, conversation_id: int, message: str) -> None:
+    """Mark the most recent still-open clarify card answered by this message.
+
+    The card keeps its question/options (history is append-only) and gains
+    completed=True + the learner's answer, so reloads render it read-only.
+    (JSON columns need full reassignment for change tracking.)
+    """
+    open_cards = db.scalars(
+        select(models.ChatMessage)
+        .where(
+            models.ChatMessage.conversation_id == conversation_id,
+            models.ChatMessage.role == "clarify",
+        )
+        .order_by(models.ChatMessage.id.desc())
+    ).all()
+    for card in open_cards:
+        calls = list(card.tool_calls or [])
+        if not calls or not isinstance(calls[0], dict):
+            continue
+        args = dict(calls[0].get("args") or {})
+        if args.get("completed"):
+            continue
+        calls[0] = {
+            **calls[0],
+            "args": {**args, "completed": True, "answer": message[:500]},
+        }
+        card.tool_calls = calls
+        db.commit()
+        break
 
 
 def _ui_state_line(ui_context: dict | None) -> str:
@@ -188,9 +260,38 @@ def _persist_quiz_message(db, conversation_id: int, quiz: dict) -> int:
     return msg.id
 
 
+def _capture_clarify(name: str, result) -> dict | None:
+    """Pull the clarify payload out of an ask_clarify tool result."""
+    if name != "ask_clarify" or not isinstance(result, dict):
+        return None
+    if not result.get("question"):
+        return None
+    return {
+        "question": result.get("question", ""),
+        "options": result.get("options", []) or [],
+        "allow_free_text": result.get("allow_free_text", True),
+    }
+
+
+def _persist_clarify_message(db, conversation_id: int, clarify: dict) -> int:
+    """Persist the clarify card as role='clarify' (payload rides the
+    existing tool_calls JSON column — no migration) and return its id."""
+    msg = models.ChatMessage(
+        conversation_id=conversation_id,
+        role="clarify",
+        content="",
+        tool_calls=[{"tool": "clarify", "args": clarify}],
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    return msg.id
+
+
 def _finalize_turn(db, conversation_id: int, reply: str, tool_calls: list[dict],
-                   ui_actions: list[dict], quiz: dict | None) -> dict:
-    """Persist the turn (assistant reply + optional inline quiz card) and
+                   ui_actions: list[dict], quiz: dict | None,
+                   clarify: dict | None = None) -> dict:
+    """Persist the turn (assistant reply + optional inline quiz/clarify card) and
     build the turn dict shared by the sync and streaming paths."""
     _close_turn(db, conversation_id, reply, tool_calls)
     out: dict = {
@@ -199,20 +300,24 @@ def _finalize_turn(db, conversation_id: int, reply: str, tool_calls: list[dict],
         "tool_calls": tool_calls,
         "ui_actions": ui_actions,
         "quiz": None,
+        "clarify": None,
     }
     if quiz:
         # The inline card replaces the old open_quiz navigation this turn.
         out["ui_actions"] = [a for a in ui_actions if a.get("action") != "open_quiz"]
         message_id = _persist_quiz_message(db, conversation_id, quiz)
         out["quiz"] = {"message_id": message_id, **quiz}
+    if clarify:
+        message_id = _persist_clarify_message(db, conversation_id, clarify)
+        out["clarify"] = {"message_id": message_id, **clarify}
     return out
 
 
 def run_tutor_turn(db, user_id: int, conversation_id: int | None, message: str,
                    ui_context: dict | None = None) -> dict:
     """One chat turn (non-streamed): run the tool loop, persist, return reply."""
-    conversation_id, messages = _open_turn(db, user_id, conversation_id, message, ui_context)
-    return _run_tool_loop(db, user_id, conversation_id, messages)
+    conversation_id, messages, thread_id = _open_turn(db, user_id, conversation_id, message, ui_context)
+    return _run_tool_loop(db, user_id, conversation_id, messages, thread_id)
 
 
 def _parse_call(call: dict) -> tuple[str, dict]:
@@ -265,15 +370,18 @@ def _dedupe_key(name: str, args: dict) -> str:
         return f"{name}:{args}"
 
 
-def _run_tool_loop(db, user_id: int, conversation_id: int, messages: list[dict]) -> dict:
+def _run_tool_loop(db, user_id: int, conversation_id: int, messages: list[dict],
+                   thread_id: str | None = None) -> dict:
     tools = openai_tools()
     tool_calls: list[dict] = []
     ui_actions: list[dict] = []
     quiz: dict | None = None
+    clarify: dict | None = None
     seen: set[str] = set()  # exact-duplicate (tool, args) calls run once per turn
     reply = ""
     for _ in range(MAX_TOOL_ROUNDS):
-        msg = asyncio.run(chat_with_tools(messages, tools=tools, temperature=0.4))
+        msg = asyncio.run(chat_with_tools(messages, tools=tools, temperature=0.4,
+                                          thread_id=thread_id))
         calls = msg.get("tool_calls") or []
         messages.append(
             {
@@ -310,6 +418,8 @@ def _run_tool_loop(db, user_id: int, conversation_id: int, messages: list[dict])
             tool_calls.append({"tool": name, "args": args, "result_preview": _preview(result)})
             if quiz is None:
                 quiz = _capture_quiz(name, result)
+            if clarify is None:
+                clarify = _capture_clarify(name, result)
             if ui_action is not None:
                 ui_actions.append(ui_action)
             messages.append(
@@ -322,7 +432,7 @@ def _run_tool_loop(db, user_id: int, conversation_id: int, messages: list[dict])
     else:
         reply = reply or "Let me know how you'd like to proceed."
 
-    return _finalize_turn(db, conversation_id, reply, tool_calls, ui_actions, quiz)
+    return _finalize_turn(db, conversation_id, reply, tool_calls, ui_actions, quiz, clarify)
 
 
 def run_quiz_debrief(db, user_id: int, conversation_id: int, assessment_id: int) -> dict:
@@ -395,24 +505,23 @@ def run_quiz_debrief(db, user_id: int, conversation_id: int, assessment_id: int)
         select(models.ChatMessage)
         .where(models.ChatMessage.conversation_id == conversation_id)
         .order_by(models.ChatMessage.id.desc())
-        .limit(20)
+        .limit(30)
     ).all()
-    transcript = "\n".join(
-        f"{'Student' if m.role == 'user' else 'Tutor'}: {m.content}"
-        for m in reversed(history)
-        if m.role in ("user", "assistant")
-    )
+    prior = [m for m in reversed(history) if m.role in ("user", "assistant")]
     snapshot = build_snapshot(db, user_id)
+    thread_id = _thread_id(user_id, conversation_id)
     messages = [
-        {"role": "system", "content": f"{TUTOR_PROMPT}\n\n{QUIZ_DEBRIEF_PROMPT}\n\nLEARNER SNAPSHOT: {snapshot}"},
-        {"role": "user", "content": (
-            f"CONVERSATION SO FAR:\n{transcript}\n\n"
-            "=== HIDDEN QUIZ RESULTS (the student cannot see this — "
-            "never quote scores, feedback, or rubrics) ===\n"
-            f"{summary}\n\nWrite your debrief recommendation now."
-        )},
+        {"role": "system", "content": f"{TUTOR_PROMPT}\n\n{QUIZ_DEBRIEF_PROMPT}"},
     ]
-    return _run_tool_loop(db, user_id, conversation_id, messages)
+    for m in prior[-20:]:
+        messages.append({"role": m.role, "content": m.content})
+    messages.append({"role": "user", "content": (
+        f"LEARNER SNAPSHOT: {snapshot}\n\n"
+        "=== HIDDEN QUIZ RESULTS (the student cannot see this — "
+        "never quote scores, feedback, or rubrics) ===\n"
+        f"{summary}\n\nWrite your debrief recommendation now."
+    )})
+    return _run_tool_loop(db, user_id, conversation_id, messages, thread_id)
 
 
 async def stream_tutor_turn(db, user_id: int, conversation_id: int | None, message: str,
@@ -422,17 +531,18 @@ async def stream_tutor_turn(db, user_id: int, conversation_id: int | None, messa
     {"type": "token", "text"}, then {"type": "done", ...} (same shape as
     run_tutor_turn's return). Persists both messages like the sync version.
     """
-    conversation_id, messages = _open_turn(db, user_id, conversation_id, message, ui_context)
+    conversation_id, messages, thread_id = _open_turn(db, user_id, conversation_id, message, ui_context)
     tools = openai_tools()
     tool_calls: list[dict] = []
     ui_actions: list[dict] = []
     quiz: dict | None = None
+    clarify: dict | None = None
     seen: set[str] = set()  # exact-duplicate (tool, args) calls run once per turn
     reply = ""
     for _ in range(MAX_TOOL_ROUNDS):
         content_parts: list[str] = []
         calls: list[dict] = []
-        async for kind, payload in chat_stream(messages, tools=tools):
+        async for kind, payload in chat_stream(messages, tools=tools, thread_id=thread_id):
             if kind == "token":
                 content_parts.append(payload)
                 yield {"type": "token", "text": payload}
@@ -468,6 +578,8 @@ async def stream_tutor_turn(db, user_id: int, conversation_id: int | None, messa
             yield {"type": "tool", "tool": name, "args": args, "result_preview": preview}
             if quiz is None:
                 quiz = _capture_quiz(name, result)
+            if clarify is None:
+                clarify = _capture_clarify(name, result)
             if ui_action is not None:
                 ui_actions.append(ui_action)
             messages.append(
@@ -480,4 +592,4 @@ async def stream_tutor_turn(db, user_id: int, conversation_id: int | None, messa
     else:
         reply = reply or "Let me know how you'd like to proceed."
 
-    yield {"type": "done", **_finalize_turn(db, conversation_id, reply, tool_calls, ui_actions, quiz)}
+    yield {"type": "done", **_finalize_turn(db, conversation_id, reply, tool_calls, ui_actions, quiz, clarify)}

@@ -20,6 +20,25 @@ LLM_BASE_URL = os.environ.get("KB_LLM_BASE_URL", "http://127.0.0.1:9173/v1")
 LLM_MODEL = os.environ.get("KB_LLM_MODEL", "EXPERT")
 _HTTP_TIMEOUT = 300.0  # local model can be slow
 
+# thread_id is a proxy-only extension (real OpenAI rejects unknown fields
+# with 400). Auto-send it only to the local proxy; override with
+# KB_LLM_THREADING=1 (force on) or =0 (force off, e.g. real OpenAI APIs).
+# If a server ever 400s on it, we latch off and retry without (see below).
+_THREAD_FORCED = os.environ.get("KB_LLM_THREADING", "").strip().lower()
+_THREAD_OK = True  # latched False after the first thread_id rejection
+
+
+def _threading_allowed() -> bool:
+    if _THREAD_FORCED in ("1", "true", "yes", "on"):
+        return True
+    if _THREAD_FORCED in ("0", "false", "no", "off"):
+        return False
+    return "9173" in LLM_BASE_URL or "localhost" in LLM_BASE_URL or "127.0.0.1" in LLM_BASE_URL
+
+
+def _use_thread(thread_id: str | None) -> str | None:
+    return thread_id if (thread_id and _THREAD_OK and _threading_allowed()) else None
+
 
 async def _chat(messages: list[dict], temperature: float = 0.2) -> str:
     """One-shot chat completion against the local OpenAI-compatible endpoint."""
@@ -32,9 +51,23 @@ async def chat_with_tools(
     tools: list[dict] | None = None,
     temperature: float = 0.2,
     tool_choice: str = "auto",
+    thread_id: str | None = None,
 ) -> dict:
     """Chat completion with native OpenAI tool-calling. Returns the raw
-    assistant message dict (may contain `tool_calls`)."""
+    assistant message dict (may contain `tool_calls`).
+
+    thread_id pins the turn to one server-side DeepSeek conversation: the
+    proxy reuses the same conversation when thread_id is stable and sends
+    only the delta (messages after the last assistant message). Without it
+    the proxy hashes the first message, so a rebuilt transcript spawns a
+    new conversation every turn.
+
+    thread_id is proxy-only: it is sent only when _threading_allowed()
+    (local proxy URL, or KB_LLM_THREADING=1) and silently dropped for
+    real OpenAI-compatible APIs — plus a 400 on it latches off with one
+    retry, so strict servers never break.
+    """
+    global _THREAD_OK
     payload: dict = {
         "model": LLM_MODEL,
         "messages": messages,
@@ -44,17 +77,31 @@ async def chat_with_tools(
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice
+    tid = _use_thread(thread_id)
+    if tid:
+        payload["thread_id"] = tid
     async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
         r = await client.post(f"{LLM_BASE_URL}/chat/completions", json=payload)
+        if r.status_code == 400 and tid:
+            # Strict server rejected the proxy-only field — latch off and
+            # retry once without it.
+            _THREAD_OK = False
+            del payload["thread_id"]
+            r = await client.post(f"{LLM_BASE_URL}/chat/completions", json=payload)
         r.raise_for_status()
         data = r.json()
         return data["choices"][0]["message"]
 
 
-async def chat_stream(messages: list[dict], tools: list[dict] | None = None):
+async def chat_stream(messages: list[dict], tools: list[dict] | None = None,
+                    thread_id: str | None = None):
     """Stream a chat completion. Yields ("token", text) deltas, then finally
     ("done", {"content": str, "tool_calls": [...]}). Tool-call argument
     fragments are accumulated by index — some gateways stream them in pieces.
+    thread_id pins to one server-side conversation (see chat_with_tools).
+    For streams a 400 can't be retried mid-flight, so thread_id is only
+    attached when the endpoint is known-good (_THREAD_OK from a prior
+    non-stream call, or the threading allowlist).
     """
     payload: dict = {
         "model": LLM_MODEL,
@@ -65,6 +112,9 @@ async def chat_stream(messages: list[dict], tools: list[dict] | None = None):
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
+    tid = _use_thread(thread_id)
+    if tid:
+        payload["thread_id"] = tid
     content_parts: list[str] = []
     pending: dict[int, dict] = {}
     async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:

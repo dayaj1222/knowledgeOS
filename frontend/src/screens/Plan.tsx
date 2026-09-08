@@ -9,7 +9,8 @@ import {
 } from "lucide-react";
 import { getPlans, getDeadlines, createDeadline, USER_ID } from "../api";
 import type { Plan, Deadline } from "../api";
-import { useFetch, Spinner } from "../hooks";
+import { useFetch, Spinner, useToastError } from "../hooks";
+import { notifyError } from "../components/notifications";
 import { EmptyState } from "../components/indicators";
 
 export default function PlanScreen() {
@@ -20,6 +21,8 @@ export default function PlanScreen() {
   const [weight, setWeight] = useState(15);
   const [saved, setSaved] = useState<{ ok: boolean; msg: string } | null>(null);
   const [adding, setAdding] = useState(false);
+  useToastError(plans.error);
+  useToastError(deadlines.error);
 
   async function addDeadline(e: React.FormEvent) {
     e.preventDefault();
@@ -39,7 +42,7 @@ export default function PlanScreen() {
       deadlines.reload();
       setTimeout(() => setSaved(null), 4000);
     } catch (e) {
-      setSaved({ ok: false, msg: `Error: ${(e as Error).message}` });
+      notifyError((e as Error).message);
     } finally {
       setAdding(false);
     }
@@ -93,11 +96,6 @@ export default function PlanScreen() {
             </div>
 
             {plans.loading && <Spinner />}
-            {plans.error && (
-              <div className="p-3 rounded-lg bg-rose-950/30 border border-rose-800/40 text-rose-300 text-xs">
-                {plans.error}
-              </div>
-            )}
 
             {plans.data && plans.data.length === 0 && (
               <EmptyState
@@ -176,11 +174,6 @@ export default function PlanScreen() {
             </div>
 
             {deadlines.loading && <Spinner />}
-            {deadlines.error && (
-              <div className="p-3 rounded-lg bg-rose-950/30 border border-rose-800/40 text-rose-300 text-xs">
-                {deadlines.error}
-              </div>
-            )}
 
             {deadlines.data && deadlines.data.length === 0 && (
               <EmptyState message="No deadlines scheduled yet." />
@@ -258,13 +251,7 @@ export default function PlanScreen() {
               </button>
 
               {saved && (
-                <div
-                  className={`p-2.5 rounded-lg text-xs ${
-                    saved.ok
-                      ? "bg-emerald-950/40 text-emerald-300 border border-emerald-800/40"
-                      : "bg-rose-950/40 text-rose-300 border border-rose-800/40"
-                  }`}
-                >
+                <div className="p-2.5 rounded-lg text-xs bg-emerald-950/40 text-emerald-300 border border-emerald-800/40">
                   {saved.msg}
                 </div>
               )}

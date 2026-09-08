@@ -21,6 +21,7 @@ from ..services import (
     ScheduleService,
     StudyService,
 )
+from ..services.review_service import score_to_quality
 from .web import fetch_url as _fetch_url
 from .web import search_web as _search_web
 
@@ -139,9 +140,11 @@ def recent_answers(db, user_id: int, args: dict) -> list[dict]:
 
 def get_due_reviews(db, user_id: int, args: dict) -> list[dict]:
     limit = min(int(args.get("limit", 10)), 20)
+    # ReviewService.due_queue already returns dicts (topic_id, topic_name,
+    # due_date, ...). Reshape to the stable {topic_id, topic} contract.
     return [
-        {"topic_id": t.id, "topic": t.name}
-        for t in ReviewService.due_queue(db, user_id, limit=limit)
+        {"topic_id": d["topic_id"], "topic": d.get("topic_name", f"#{d['topic_id']}")}
+        for d in ReviewService.due_queue(db, user_id, limit=limit)
     ]
 
 
@@ -372,6 +375,73 @@ def take_passage_note(db, user_id: int, args: dict) -> dict:
     db.commit()
     db.refresh(note)
     return {"saved": True, "id": note.id, "passage_id": passage.id}
+
+
+def ask_clarify(db, user_id: int, args: dict) -> dict:
+    """Ask a disambiguating question — renders INLINE as a selection card
+    (options tappable, free-text allowed). No confirmation needed."""
+    question = str(args.get("question", "")).strip()[:500]
+    options = [str(o).strip()[:120] for o in (args.get("options") or [])]
+    options = [o for o in options if o][:4]
+    allow_free_text = bool(args.get("allow_free_text", True))
+    if not question:
+        return {"error": "question must be non-empty"}
+    return {
+        "type": "clarify",
+        "question": question,
+        "options": options,
+        "allow_free_text": allow_free_text,
+        "hint": (
+            "This renders INLINE as a selection card. Introduce it briefly "
+            "(1-2 sentences), then end with: CLARIFY_READY — do NOT paste "
+            "the options as a text list."
+        ),
+    }
+
+
+#: Weight for chat-demonstrated understanding vs stored score per event.
+LEARN_ALPHA = 0.2
+
+
+def record_understanding(db, user_id: int, args: dict) -> dict:
+    """Record understanding the learner demonstrated IN CHAT (a correct
+    explanation, a good paraphrase, a right answer to a check question).
+    Bumps proficiency immediately — no confirmation, never announced."""
+    try:
+        topic_id = int(args["topic_id"])
+        demonstrated = max(0.0, min(1.0, float(args.get("demonstrated", 0.8))))
+    except (TypeError, ValueError, KeyError):
+        return {"error": "topic_id (int) and demonstrated (0.0-1.0) required"}
+    evidence = str(args.get("evidence", ""))[:300]
+    topic = db.get(models.Topic, topic_id)
+    if topic is None:
+        return {"error": f"topic {topic_id} not found"}
+    prof = db.scalar(
+        select(models.Proficiency).where(
+            models.Proficiency.user_id == user_id,
+            models.Proficiency.topic_id == topic_id,
+        )
+    )
+    if prof is None:
+        prof = models.Proficiency(
+            user_id=user_id, topic_id=topic_id, score=round(demonstrated, 4)
+        )
+        db.add(prof)
+    else:
+        prof.score = round(
+            (1 - LEARN_ALPHA) * prof.score + LEARN_ALPHA * demonstrated, 4
+        )
+        db.add(prof)
+    # Demonstrating recall is also a recall event for the SM-2 schedule.
+    ReviewService.record_result(
+        db, user_id=user_id, topic_id=topic_id,
+        quality=score_to_quality(demonstrated),
+    )
+    if evidence and prof.strengths is not None and evidence not in (prof.strengths or []):
+        prof.strengths = ([*(prof.strengths or []), evidence])[:8]
+        db.add(prof)
+    db.commit()
+    return {"recorded": True, "topic_id": topic_id, "score": round(prof.score, 2)}
 
 
 # ---------- direct database access (the "modify db directly" power) ----------
@@ -627,6 +697,32 @@ TOOLS: dict[str, dict[str, Any]] = {
         ),
         "parameters": {"type": "object", "properties": {"passage_id": {"type": "integer"}, "note": {"type": "string"}, "confirmed": {"type": "boolean"}}, "required": ["passage_id", "note"]},
         "run": take_passage_note,
+    },
+    "ask_clarify": {
+        "signature": '(question: str, options?: str[], allow_free_text?: bool)',
+        "description": (
+            "Ask a disambiguating question — renders INLINE as a tappable "
+            "selection card (options) plus optional free-text answer. Use when "
+            "the request is ambiguous: which topic, what depth, which exam, "
+            "what the learner already knows. Max 4 short options. No "
+            "confirmation needed; never use for quiz questions (use "
+            "generate_quiz) or confirmations of mutations."
+        ),
+        "parameters": {"type": "object", "properties": {"question": {"type": "string"}, "options": {"type": "array", "items": {"type": "string"}}, "allow_free_text": {"type": "boolean"}}, "required": ["question"]},
+        "run": ask_clarify,
+    },
+    "record_understanding": {
+        "signature": '(topic_id: int, demonstrated: float, evidence?: str)',
+        "description": (
+            "Record understanding the learner demonstrated IN CHAT: a correct "
+            "explanation, an accurate paraphrase, a right answer to a check "
+            "question. demonstrated is 0.0-1.0 for how fully correct they "
+            "were; evidence is a short quote of what they got right. "
+            "Background write — no confirmation, never mention scores. Call "
+            "it in the same turn you praise/confirm their answer."
+        ),
+        "parameters": {"type": "object", "properties": {"topic_id": {"type": "integer"}, "demonstrated": {"type": "number"}, "evidence": {"type": "string"}}, "required": ["topic_id", "demonstrated"]},
+        "run": record_understanding,
     },
 }
 

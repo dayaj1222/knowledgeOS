@@ -11,7 +11,6 @@ import {
   TrendingUp,
   Award,
   Clock3,
-  AlertTriangle,
   Play,
   CheckCircle2,
   Calendar,
@@ -24,9 +23,9 @@ import {
   getModules,
   getTopics,
   USER_ID,
-  type Topic,
 } from "../api";
-import { useFetch, Spinner } from "../hooks";
+import { useFetch, Spinner, useToastError } from "../hooks";
+import { notifyError } from "../components/notifications";
 import { ProficiencyBar, EmptyState } from "../components/indicators";
 
 interface TopicInfo {
@@ -56,18 +55,25 @@ export default function Dashboard() {
     if (!courseList) return;
     let cancelled = false;
     (async () => {
-      const entries = await Promise.all(
+      const results = await Promise.all(
         courseList.map(async (course) => {
-          const modules = await getModules(course.id).catch(() => []);
-          const topics = await Promise.all(
-            modules.map((m) => getTopics(m.id).catch(() => [] as Topic[]))
-          );
-          return { courseName: course.name, topics: topics.flat() };
+          try {
+            const modules = await getModules(course.id);
+            const topics = (
+              await Promise.all(modules.map((m) => getTopics(m.id)))
+            ).flat();
+            return { courseName: course.name, topics, failed: false };
+          } catch {
+            return { courseName: course.name, topics: [], failed: true };
+          }
         })
       );
       if (!cancelled) {
+        if (results.some((r) => r.failed)) {
+          notifyError("Couldn't load topics for some courses.");
+        }
         setTopicInfo(
-          entries.flatMap(({ courseName, topics }) =>
+          results.flatMap(({ courseName, topics }) =>
             topics.map((t) => ({ topicId: t.id, name: t.name, courseName }))
           )
         );
@@ -136,16 +142,22 @@ export default function Dashboard() {
     proficiency.error ||
     deadlines.error ||
     plans.error;
+  useToastError(anyError);
 
   if (anyError) {
+    const retryAll = () => {
+      courses.reload();
+      proficiency.reload();
+      deadlines.reload();
+      plans.reload();
+    };
     return (
-      <div className="p-6 rounded-2xl bg-rose-950/30 border border-rose-800/40 text-rose-200">
-        <h1 className="text-xl font-bold flex items-center gap-2 mb-2">
-          <AlertTriangle className="text-rose-400" size={20} /> Error loading dashboard
-        </h1>
-        <p className="text-sm opacity-90">
-          {courses.error || proficiency.error || deadlines.error || plans.error}
-        </p>
+      <div className="p-6 rounded-2xl bg-card border border-border text-sm text-muted-foreground space-y-3">
+        <h1 className="text-base font-bold text-foreground">Couldn't load dashboard</h1>
+        <p className="text-xs">Something failed while fetching your data — details are in the notification.</p>
+        <button className="btn-secondary text-xs py-2 px-4" onClick={retryAll}>
+          Retry
+        </button>
       </div>
     );
   }
