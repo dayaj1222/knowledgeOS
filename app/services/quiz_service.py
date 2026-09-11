@@ -17,34 +17,36 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..agent import (
     aevaluate_answer as a_agent_evaluate_answer,
+)
+from ..agent import (
     agenerate_questions as a_agent_generate_questions,
+)
+from ..agent import (
     evaluate_answer as agent_evaluate_answer,
+)
+from ..agent import (
     generate_questions as agent_generate_questions,
 )
-
-ALPHA = 0.3  # proficiency running-average weight for each new attempt
+from ..config import settings
+from .proficiency_service import QUIZ_ATTEMPT, ProficiencyService
 
 
 class QuizService:
-    # ---- proficiency write-back ----
+    # ---- proficiency write-back (ledgered via ProficiencyService) ----
     @staticmethod
     def fold_attempt_into_proficiency(
         db: Session, attempt: models.Attempt, topic_id: int
     ) -> None:
-        prof = db.scalar(
-            select(models.Proficiency).where(
-                models.Proficiency.user_id == attempt.user_id,
-                models.Proficiency.topic_id == topic_id,
-            )
+        db.flush()  # attempt.id must exist for the ledger ref
+        ProficiencyService.record(
+            db,
+            user_id=attempt.user_id,
+            topic_id=topic_id,
+            observed=attempt.score,
+            alpha=settings.proficiency.quiz_alpha,
+            source=QUIZ_ATTEMPT,
+            ref_id=attempt.id,
         )
-        if prof is None:
-            prof = models.Proficiency(
-                user_id=attempt.user_id, topic_id=topic_id, score=attempt.score
-            )
-            db.add(prof)
-        else:
-            prof.score = (1 - ALPHA) * prof.score + ALPHA * attempt.score
-            db.add(prof)
 
     # ---- question synthesis ----
     @staticmethod

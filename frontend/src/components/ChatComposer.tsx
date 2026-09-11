@@ -5,6 +5,7 @@ const COMMANDS = [
   { command: "/new", description: "Start a new chat" },
   { command: "/history", description: "Browse past conversations" },
   { command: "/quiz", description: "Generate a practice quiz" },
+  { command: "/review", description: "Revise what's due" },
   { command: "/plan", description: "Build a study plan" },
 ];
 
@@ -78,6 +79,7 @@ export default function ChatComposer({
           className="w-full mx-auto flex items-end gap-2.5"
         >
           <textarea
+            id="tutor-composer"
             ref={inputRef}
             value={input}
             onChange={(e) => {

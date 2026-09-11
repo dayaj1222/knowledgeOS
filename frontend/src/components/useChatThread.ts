@@ -2,9 +2,10 @@
 // localStorage caching (messages per conversation + conversation list) so
 // switching threads/tabs never flashes empty while revalidating.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
+  createStudyLog,
   getChatMessages,
   getConversations,
   sendChatStream,
@@ -12,6 +13,7 @@ import {
   type ChatMessage,
   type ChatTurn,
   type Conversation,
+  type TodoPayload,
   type ToolCall,
   type UiContext,
 } from "../api";
@@ -21,6 +23,14 @@ import { runUiActions } from "./chatUi";
 
 const LS_CONVOS = "kb.convos";
 const LS_MSGS = (id: number) => `kb.chat.${id}`;
+const LS_TIMER = "kb.timer";
+
+export interface ActiveTimer {
+  topicId: number;
+  topicName: string;
+  label: string;
+  startedAt: number;
+}
 
 function readCache<T>(key: string): T | null {
   try {
@@ -47,6 +57,30 @@ export function dropThreadCache(id: number) {
   }
 }
 
+function extractTodo(msgs: ChatMessage[]): TodoPayload | null {
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    // New card shape + legacy cached shapes (pre-cards-table threads).
+    const args = (m.card?.payload
+      ?? m.tool_calls?.[0]?.args
+      ?? {}) as Record<string, unknown>;
+    const isTodo = (m.role === "card" && m.card?.kind === "todo") || m.role === "todo";
+    if (!isTodo) continue;
+    if (Array.isArray(args.todos)) return { message_id: m.id, ...(args as object) } as TodoPayload;
+  }
+  return null;
+}
+
+function makeCard(id: number, kind: string, payload: unknown): ChatMessage {
+  return {
+    id,
+    role: "card",
+    content: "",
+    card: { kind, payload: (payload ?? {}) as Record<string, unknown> },
+    created_at: new Date().toISOString(),
+  };
+}
+
 export function useChatThread() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -68,6 +102,27 @@ export function useChatThread() {
   const [busy, setBusy] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [liveTools, setLiveTools] = useState<ToolCall[]>([]);
+  // Study timer: tutor-started via start_timer, renders as a live pill.
+  // Persisted so a reload keeps counting from the original start.
+  const [timer, setTimer] = useState<ActiveTimer | null>(
+    () => readCache<ActiveTimer>(LS_TIMER)
+  );
+  // Agent todo list: latest update_todo payload (side-panel graph).
+  // Derived from turn.todo on send + last todo card on load.
+  const [todo, setTodo] = useState<TodoPayload | null>(null);
+  // Ref mirror — the send() callback reads the live timer without going stale.
+  const timerRef = useRef<ActiveTimer | null>(readCache<ActiveTimer>(LS_TIMER));
+
+  const persistTimer = useCallback((t: ActiveTimer | null) => {
+    timerRef.current = t;
+    setTimer(t);
+    try {
+      if (t) localStorage.setItem(LS_TIMER, JSON.stringify(t));
+      else localStorage.removeItem(LS_TIMER);
+    } catch {
+      // best-effort
+    }
+  }, []);
 
   const refreshList = useCallback(async () => {
     try {
@@ -87,14 +142,21 @@ export function useChatThread() {
   useEffect(() => {
     if (activeConversationId == null) {
       setMessages([]);
+      setTodo(null);
       return;
     }
     const cached = readCache<ChatMessage[]>(LS_MSGS(activeConversationId));
-    if (cached) setMessages(cached);
-    else setMessages([]);
+    if (cached) {
+      setMessages(cached);
+      setTodo(extractTodo(cached));
+    } else {
+      setMessages([]);
+      setTodo(null);
+    }
     getChatMessages(activeConversationId)
       .then((fresh) => {
         setMessages(fresh);
+        setTodo(extractTodo(fresh));
         writeCache(LS_MSGS(activeConversationId), fresh);
       })
       .catch((e) => notifyError((e as Error).message));
@@ -117,16 +179,22 @@ export function useChatThread() {
       setMessages((m) => {
         // Mirror the server: this answer closes the most recent still-open
         // clarify card (server stamps it on arrival; reload wins on conflict).
+        // Handles both card shapes and legacy cached role="clarify" rows.
         let lastOpen = -1;
         m.forEach((x, i) => {
-          if (x.role !== "clarify") return;
-          const a = (x.tool_calls?.[0]?.args ?? {}) as { completed?: boolean };
+          const kind = x.role === "card" ? x.card?.kind : x.role;
+          if (kind !== "clarify") return;
+          const a = (x.card?.payload ?? x.tool_calls?.[0]?.args ?? {}) as { completed?: boolean };
           if (!a.completed) lastOpen = i;
         });
         const stamped = lastOpen === -1 ? m : m.map((x, i) => {
           if (i !== lastOpen) return x;
-          const a = (x.tool_calls?.[0]?.args ?? {}) as Record<string, unknown>;
-          return { ...x, tool_calls: [{ tool: "clarify", args: { ...a, completed: true, answer: msg } }] };
+          const a = (x.card?.payload ?? x.tool_calls?.[0]?.args ?? {}) as Record<string, unknown>;
+          const stampedArgs = { ...a, completed: true, answer: msg };
+          if (x.role === "card" && x.card) {
+            return { ...x, card: { ...x.card, payload: stampedArgs } };
+          }
+          return { ...x, tool_calls: [{ tool: "clarify", args: stampedArgs }] };
         });
         const next = [...stamped, userMsg];
         if (activeConversationId != null) writeCache(LS_MSGS(activeConversationId), next);
@@ -165,40 +233,44 @@ export function useChatThread() {
           writeCache(LS_MSGS(turn.conversation_id), next);
           return next;
         });
-        // Inline quiz: the tutor generated questions this turn — render the
-        // sliding card right after the reply (persisted server-side as a
-        // role="quiz" message, so it also restores on reload).
-        if (turn.quiz) {
-          const quizMsg: ChatMessage = {
-            id: turn.quiz.message_id,
-            role: "quiz",
-            content: "",
-            tool_calls: [{ tool: "quiz", args: turn.quiz }],
-            created_at: new Date().toISOString(),
-          };
+        // Inline cards (quiz/clarify/review/todo/video): one construction
+        // path for every kind — server persists them to the cards table,
+        // so they restore on reload in display order.
+        const newCards: { kind: string; payload: unknown }[] = [];
+        if (turn.quiz) newCards.push({ kind: "quiz", payload: turn.quiz });
+        if (turn.clarify) newCards.push({ kind: "clarify", payload: turn.clarify });
+        if (turn.review) newCards.push({ kind: "review", payload: turn.review });
+        if (turn.todo) newCards.push({ kind: "todo", payload: turn.todo });
+        if (turn.video) newCards.push({ kind: "video", payload: turn.video });
+        for (const { kind, payload } of newCards) {
+          const messageId = (payload as { message_id: number }).message_id;
+          const cardMsg = makeCard(messageId, kind, payload);
+          if (kind === "todo") setTodo(payload as TodoPayload);
           setMessages((m) => {
-            if (m.some((x) => x.id === quizMsg.id)) return m;
-            const next = [...m, quizMsg];
+            if (m.some((x) => x.id === cardMsg.id)) return m;
+            const next = [...m, cardMsg];
             writeCache(LS_MSGS(turn.conversation_id), next);
             return next;
           });
         }
-        // Inline clarify: a disambiguating question — tappable options plus
-        // optional free text (role="clarify", same persistence pattern).
-        if (turn.clarify) {
-          const clarifyMsg: ChatMessage = {
-            id: turn.clarify.message_id,
-            role: "clarify",
-            content: "",
-            tool_calls: [{ tool: "clarify", args: turn.clarify }],
-            created_at: new Date().toISOString(),
-          };
-          setMessages((m) => {
-            if (m.some((x) => x.id === clarifyMsg.id)) return m;
-            const next = [...m, clarifyMsg];
-            writeCache(LS_MSGS(turn.conversation_id), next);
-            return next;
+        // Study timer: start replaces any running timer; stop logs the
+        // elapsed session as a study log (tutor's reply covers the chat side).
+        if (turn.timer?.action === "start" && turn.timer.topic_id != null) {
+          persistTimer({
+            topicId: turn.timer.topic_id,
+            topicName: turn.timer.topic_name ?? "",
+            label: turn.timer.label ?? turn.timer.topic_name ?? "Study session",
+            startedAt: Date.now(),
           });
+        } else if (turn.timer?.action === "stop") {
+          const t = timerRef.current;
+          persistTimer(null);
+          if (t) {
+            const minutes = Math.floor((Date.now() - t.startedAt) / 60000);
+            if (minutes >= 1) {
+              createStudyLog({ topic_id: t.topicId, minutes_spent: minutes }).catch(() => {});
+            }
+          }
         }
         runUiActions(turn.ui_actions ?? [], {
           navigate,
@@ -231,8 +303,26 @@ export function useChatThread() {
       reloadTree,
       selectedCourseId,
       selectedCourse,
+      persistTimer,
     ]
   );
+
+  // Manual stop from the timer pill: log the session, then tell the tutor
+  // in plain words so it responds naturally (record_understanding etc.).
+  // Under a minute of study is noise — stop silently without logging.
+  const stopTimer = useCallback(async () => {
+    const t = timerRef.current;
+    persistTimer(null);
+    if (!t) return;
+    const minutes = Math.floor((Date.now() - t.startedAt) / 60000);
+    if (minutes < 1) return;
+    try {
+      await createStudyLog({ topic_id: t.topicId, minutes_spent: minutes });
+    } catch {
+      // best-effort; the chat message still carries the session
+    }
+    await send(`Finished studying ${t.label} for ${minutes} min`);
+  }, [persistTimer, send]);
 
   return {
     conversations,
@@ -242,6 +332,9 @@ export function useChatThread() {
     streamText,
     liveTools,
     send,
+    timer,
+    stopTimer,
+    todo,
     submitQuiz: async (conversationId: number, assessmentId: number) => {
       // Per-card answers were graded silently already; this runs the hidden
       // tutor debrief and appends ONLY the recommendation to the thread.
@@ -253,6 +346,7 @@ export function useChatThread() {
         tool_calls: turn.tool_calls,
         created_at: new Date().toISOString(),
       };
+      if (turn.todo) setTodo(turn.todo);
       setMessages((m) => {
         const next = [...m, debrief];
         writeCache(LS_MSGS(turn.conversation_id), next);

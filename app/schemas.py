@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, time
-from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -18,10 +17,10 @@ class UserCreate(BaseModel):
     name: str
     email: EmailStr
     timezone: str = "Asia/Kolkata"
-    college: Optional[str] = None
+    college: str | None = None
     course_name: str = "B.Tech CSE"
-    semester: Optional[int] = None
-    location: Optional[str] = None
+    semester: int | None = None
+    location: str | None = None
 
 
 class UserOut(ORMModel):
@@ -29,10 +28,10 @@ class UserOut(ORMModel):
     name: str
     email: EmailStr
     timezone: str
-    college: Optional[str] = None
+    college: str | None = None
     course_name: str
-    semester: Optional[int] = None
-    location: Optional[str] = None
+    semester: int | None = None
+    location: str | None = None
 
 
 # ---- Course ----
@@ -40,15 +39,15 @@ class CourseCreate(BaseModel):
     name: str
     code: str
     type: str = "ETH"
-    instructor: Optional[str] = None
+    instructor: str | None = None
     credits: int = 3
-    color: Optional[str] = None
+    color: str | None = None
 
 
 class CourseUpdate(BaseModel):
-    status: Optional[str] = None
-    color: Optional[str] = None
-    instructor: Optional[str] = None
+    status: str | None = None
+    color: str | None = None
+    instructor: str | None = None
 
 
 class CourseOut(ORMModel):
@@ -57,10 +56,10 @@ class CourseOut(ORMModel):
     name: str
     code: str
     type: str
-    instructor: Optional[str] = None
+    instructor: str | None = None
     credits: int
     status: str
-    color: Optional[str] = None
+    color: str | None = None
 
 
 # ---- Module ----
@@ -70,8 +69,8 @@ class ModuleCreate(BaseModel):
 
 
 class ModuleUpdate(BaseModel):
-    name: Optional[str] = None
-    order_index: Optional[int] = None
+    name: str | None = None
+    order_index: int | None = None
 
 
 class ModuleOut(ORMModel):
@@ -85,8 +84,8 @@ class ModuleOut(ORMModel):
 class TopicCreate(BaseModel):
     module_id: int
     name: str
-    description: Optional[str] = None
-    parent_topic_id: Optional[int] = None
+    description: str | None = None
+    parent_topic_id: int | None = None
     order_index: int = 0
     priority: int = Field(default=3, ge=1, le=5)
     prerequisite_ids: list[int] = []
@@ -95,9 +94,9 @@ class TopicCreate(BaseModel):
 class TopicOut(ORMModel):
     id: int
     module_id: int
-    parent_topic_id: Optional[int] = None
+    parent_topic_id: int | None = None
     name: str
-    description: Optional[str] = None
+    description: str | None = None
     order_index: int
     priority: int
     prerequisite_ids: list[int]
@@ -105,20 +104,20 @@ class TopicOut(ORMModel):
 
 
 class TopicUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    parent_topic_id: Optional[int] = None
-    order_index: Optional[int] = None
-    priority: Optional[int] = Field(default=None, ge=1, le=5)
-    prerequisite_ids: Optional[list[int]] = None
+    name: str | None = None
+    description: str | None = None
+    parent_topic_id: int | None = None
+    order_index: int | None = None
+    priority: int | None = Field(default=None, ge=1, le=5)
+    prerequisite_ids: list[int] | None = None
 
 
 # ---- Proficiency ----
 class ProficiencyUpdate(BaseModel):
-    score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    weak_points: Optional[list] = None
-    strengths: Optional[list] = None
-    preferred_method: Optional[str] = None
+    score: float | None = Field(default=None, ge=0.0, le=1.0)
+    weak_points: list | None = None
+    strengths: list | None = None
+    preferred_method: str | None = None
 
 
 class ProficiencyOut(ORMModel):
@@ -147,7 +146,7 @@ class ResourceOut(ORMModel):
     type: str
     file_path: str
     status: str = "uploaded"
-    error: Optional[str] = None
+    error: str | None = None
 
 
 class PassageCreate(BaseModel):
@@ -161,9 +160,10 @@ class PassageOut(ORMModel):
     resource_id: int
     content: str
     index_order: int
-    topic_id: Optional[int] = None
-    page_start: Optional[int] = None
-    page_end: Optional[int] = None
+    topic_id: int | None = None
+    section_path: str | None = None
+    page_start: int | None = None
+    page_end: int | None = None
 
 
 class PassageNoteCreate(BaseModel):
@@ -185,7 +185,7 @@ class QuestionCreate(BaseModel):
     text: str
     type: str = "mcq"
     expected_key_points: list = []
-    images: Optional[str] = None
+    images: str | None = None
 
 
 class QuestionOut(ORMModel):
@@ -194,8 +194,8 @@ class QuestionOut(ORMModel):
     text: str
     type: str
     expected_key_points: list
-    images: Optional[str] = None
-    generated_by: Optional[str] = None
+    images: str | None = None
+    generated_by: str | None = None
 
 
 # ---- Assessment ----
@@ -208,7 +208,7 @@ class AssessmentOut(ORMModel):
     user_id: int
     status: str
     created_at: datetime
-    completed_at: Optional[datetime] = None
+    completed_at: datetime | None = None
 
 
 # ---- Attempt ----
@@ -216,16 +216,16 @@ class AttemptCreate(BaseModel):
     user_id: int
     assessment_id: int
     question_id: int
-    user_answer: Optional[str] = None
+    user_answer: str | None = None
 
 
 class AttemptGrade(BaseModel):
-    score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    feedback: Optional[str] = None
+    score: float | None = Field(default=None, ge=0.0, le=1.0)
+    feedback: str | None = None
     # Optional revised answer: when the learner edits an already-created
     # attempt (e.g. in-chat quiz card), update user_answer in place and
     # re-grade the SAME attempt instead of creating duplicates.
-    user_answer: Optional[str] = None
+    user_answer: str | None = None
     status: str = "answered"
     excluded: bool = False
 
@@ -243,9 +243,9 @@ class AttemptOut(ORMModel):
     user_id: int
     assessment_id: int
     question_id: int
-    user_answer: Optional[str] = None
+    user_answer: str | None = None
     score: float
-    feedback: Optional[str] = None
+    feedback: str | None = None
     matched_key_points: list[str] = []
     missed_key_points: list[str] = []
     status: str
@@ -254,20 +254,30 @@ class AttemptOut(ORMModel):
 
 # ---- Preference ----
 class PreferenceUpdate(BaseModel):
-    session_length_minutes: Optional[int] = None
-    daily_goal_minutes: Optional[int] = None
-    preferred_start: Optional[time] = None
-    preferred_end: Optional[time] = None
-    tutor_instructions: Optional[str] = None
+    session_length_minutes: int | None = None
+    daily_goal_minutes: int | None = None
+    preferred_start: time | None = None
+    preferred_end: time | None = None
+    tutor_instructions: str | None = None
+    tutor_style: str | None = None
+    tutor_verbosity: str | None = None
+    default_quiz_count: int | None = None
+    default_difficulty: str | None = None
+    review_batch_size: int | None = None
 
 
 class PreferenceOut(ORMModel):
     user_id: int
     session_length_minutes: int
     daily_goal_minutes: int
-    preferred_start: Optional[time] = None
-    preferred_end: Optional[time] = None
-    tutor_instructions: Optional[str] = None
+    preferred_start: time | None = None
+    preferred_end: time | None = None
+    tutor_instructions: str | None = None
+    tutor_style: str = "balanced"
+    tutor_verbosity: str = "balanced"
+    default_quiz_count: int = 3
+    default_difficulty: str = "medium"
+    review_batch_size: int = 8
 
 
 # ---- Schedule / Slot ----
@@ -305,7 +315,7 @@ class DeadlineCreate(BaseModel):
     course_id: int
     title: str
     due_date: datetime
-    topic_id: Optional[int] = None
+    topic_id: int | None = None
     weight: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
@@ -313,7 +323,7 @@ class DeadlineOut(ORMModel):
     id: int
     user_id: int
     course_id: int
-    topic_id: Optional[int] = None
+    topic_id: int | None = None
     title: str
     due_date: datetime
     weight: float
@@ -327,7 +337,7 @@ class PlanUpdate(BaseModel):
 class PlanOut(ORMModel):
     id: int
     user_id: int
-    slot_id: Optional[int] = None
+    slot_id: int | None = None
     topic_id: int
     suggested_duration_minutes: int
     status: str
@@ -357,21 +367,22 @@ class StudyLogCreate(BaseModel):
     user_id: int
     topic_id: int
     minutes_spent: int = Field(ge=0)
-    confidence_after: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    resource_id: Optional[int] = None
-    passage_id: Optional[int] = None
-    plan_id: Optional[int] = None
+    confidence_after: float | None = Field(default=None, ge=0.0, le=1.0)
+    resource_id: int | None = None
+    passage_id: int | None = None
+    plan_id: int | None = None
 
 
 class StudyLogOut(ORMModel):
     id: int
     user_id: int
     topic_id: int
-    resource_id: Optional[int] = None
-    passage_id: Optional[int] = None
-    plan_id: Optional[int] = None
+    resource_id: int | None = None
+    passage_id: int | None = None
+    plan_id: int | None = None
     minutes_spent: int
-    confidence_after: Optional[float] = None
+    confidence_after: float | None = None
+    created_at: datetime | None = None
 
 
 # ---- Spaced repetition ----
@@ -384,7 +395,7 @@ class ReviewResultCreate(BaseModel):
 # ---- Targeted drill ----
 class DrillRequest(BaseModel):
     user_id: int
-    topic_id: Optional[int] = None  # none = weakest topics by miss count
+    topic_id: int | None = None  # none = weakest topics by miss count
     count: int = Field(default=5, ge=1, le=25)
     difficulty: str = "medium"
 
@@ -392,16 +403,16 @@ class DrillRequest(BaseModel):
 # ---- Tutor chat ----
 class ChatRequest(BaseModel):
     user_id: int = 1
-    conversation_id: Optional[int] = None
+    conversation_id: int | None = None
     message: str = Field(min_length=1, max_length=8000)
-    ui_context: Optional[dict] = None  # {route, course_id, course_name, ...}
+    ui_context: dict | None = None  # {route, course_id, course_name, ...}
 
 
 class ChatMessageOut(ORMModel):
     id: int
     role: str
     content: str
-    tool_calls: Optional[list] = None
+    tool_calls: list | None = None
 
 
 class ConversationOut(ORMModel):

@@ -1,12 +1,10 @@
 // Shared executor for backend ui_actions (the tutor's hands on the UI).
-// Used by both the bubble drawer and the full /tutor page so commands
-// behave identically everywhere.
 
 import type { NavigateFunction } from "react-router-dom";
 import type { UiAction } from "../api";
 import { notifySuccess } from "./notifications";
 
-const ALLOWED_ROUTES = new Set(["/", "/library", "/plan", "/quiz", "/settings", "/tutor"]);
+const ALLOWED_ROUTES = new Set(["/", "/library", "/plan", "/settings"]);
 
 export function runUiActions(
   actions: UiAction[],
@@ -21,17 +19,7 @@ export function runUiActions(
   for (const a of actions ?? []) {
     const p = (a.params ?? {}) as Record<string, unknown>;
     try {
-      if (a.action === "open_quiz") {
-        const id = typeof p.assessment_id === "number" ? p.assessment_id : null;
-        if (id != null) {
-          // Durable session URL (refresh-safe); questions ride along as prefill.
-          ctx.navigate(`/quiz/take/${id}`, {
-            state: Array.isArray(p.questions) ? { questions: p.questions } : undefined,
-          });
-        } else if (Array.isArray(p.questions)) {
-          ctx.navigate("/quiz/take", { state: { questions: p.questions } });
-        }
-      } else if (
+      if (
         a.action === "navigate" &&
         typeof p.route === "string" &&
         ALLOWED_ROUTES.has(p.route)

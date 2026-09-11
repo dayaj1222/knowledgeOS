@@ -1,13 +1,10 @@
 import { BrowserRouter, Routes, Route, useLocation } from "react-router-dom";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { queryClient } from "./queryClient";
 import Sidebar from "./components/Sidebar";
-import ChatPanel from "./components/ChatPanel";
-import Dashboard from "./screens/Dashboard";
 import Tutor from "./screens/Tutor";
 import Library from "./screens/Library";
 import Plan from "./screens/Plan";
-import QuizSetup from "./pages/quiz/QuizSetup";
-import QuizTake from "./pages/quiz/QuizTake";
-import QuizResults from "./pages/quiz/QuizResults";
 import Settings from "./screens/Settings";
 import { DataProvider } from "./store";
 import { NotificationProvider } from "./components/notifications";
@@ -21,14 +18,9 @@ function AnimatedRoutes() {
   return (
     <div key={location.pathname} className="route-transition">
       <Routes location={location}>
-        <Route path="/" element={<Dashboard />} />
-        <Route path="/tutor" element={<Tutor />} />
+        <Route path="/" element={<Tutor />} />
         <Route path="/library" element={<Library />} />
         <Route path="/plan" element={<Plan />} />
-        <Route path="/quiz" element={<QuizSetup />} />
-        <Route path="/quiz/take" element={<QuizTake />} />
-        <Route path="/quiz/take/:assessmentId" element={<QuizTake />} />
-        <Route path="/quiz/results" element={<QuizResults />} />
         <Route path="/settings" element={<Settings />} />
       </Routes>
     </div>
@@ -38,6 +30,7 @@ function AnimatedRoutes() {
 export default function App() {
   return (
     <ThemeProvider>
+      <QueryClientProvider client={queryClient}>
       <DataProvider>
         <NotificationProvider>
           <BrowserRouter>
@@ -46,7 +39,6 @@ export default function App() {
             <main className="main-area">
               <AnimatedRoutes />
             </main>
-            <ChatPanel />
           </div>
         </BrowserRouter>
         <Toaster />

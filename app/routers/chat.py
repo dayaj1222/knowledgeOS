@@ -4,7 +4,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError, PendingRollbackError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
@@ -32,7 +32,7 @@ def chat(body: schemas.ChatRequest, db: Session = Depends(get_db)):
             )
             return ok(result)
         except ValueError as e:
-            raise HTTPException(404, str(e))
+            raise HTTPException(404, str(e)) from e
         except _RETRYABLE as e:
             last_error = e
             db.close()
@@ -88,7 +88,62 @@ def submit_chat_quiz(body: schemas.ChatQuizSubmit, db: Session = Depends(get_db)
         )
         return ok(result)
     except ValueError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404, str(e)) from e
+
+
+@router.get("/status")
+def engine_status(db: Session = Depends(get_db)):
+    """Real engine facts for the Settings screen: model, endpoint mode,
+    threading state, database reachability, and library counts. No dummy."""
+    from .. import ai
+
+    forced = ai._THREAD_FORCED
+    if forced in ("1", "true", "yes", "on"):
+        threading = "forced-on"
+    elif forced in ("0", "false", "no", "off"):
+        threading = "forced-off"
+    elif not ai._THREAD_OK:
+        threading = "latched-off"
+    elif ai._threading_allowed():
+        threading = "proxy-sticky"
+    else:
+        threading = "stateless"
+    try:
+        n_courses = db.scalar(
+            select(func.count(models.Course.id))
+        ) or 0
+        n_topics = db.scalar(
+            select(func.count(models.Topic.id))
+        ) or 0
+        n_conversations = db.scalar(
+            select(func.count(models.Conversation.id))
+        ) or 0
+        db_ok = True
+    except Exception:  # noqa: BLE001 — status must never 500
+        n_courses = n_topics = n_conversations = 0
+        db_ok = False
+    return ok({
+        "model": ai.LLM_MODEL,
+        "endpoint": ai.LLM_BASE_URL,
+        "threading": threading,
+        "database": "connected" if db_ok else "unreachable",
+        "courses": n_courses,
+        "topics": n_topics,
+        "conversations": n_conversations,
+    })
+
+
+@router.delete("/users/{user_id}/conversations")
+def clear_conversations(user_id: int, db: Session = Depends(get_db)):
+    """Delete ALL conversations (and their messages via cascade) for a user."""
+    convs = db.scalars(
+        select(models.Conversation).where(models.Conversation.user_id == user_id)
+    ).all()
+    n = len(convs)
+    for c in convs:
+        db.delete(c)
+    db.commit()
+    return ok({"deleted": n})
 
 
 @router.get("/users/{user_id}/conversations")
@@ -104,13 +159,25 @@ def list_conversations(user_id: int, db: Session = Depends(get_db)):
 
 @router.get("/conversations/{conversation_id}/messages")
 def conversation_messages(conversation_id: int, db: Session = Depends(get_db)):
+    """Thread in display order: user/assistant messages with their cards
+    interleaved directly after the assistant message each card follows
+    (anchored by cards.message_id; unanchored cards trail at the end)."""
     msgs = db.scalars(
         select(models.ChatMessage)
         .where(models.ChatMessage.conversation_id == conversation_id)
         .order_by(models.ChatMessage.id)
     ).all()
-    return ok(
-        [
+    cards = db.scalars(
+        select(models.Card)
+        .where(models.Card.conversation_id == conversation_id)
+        .order_by(models.Card.id)
+    ).all()
+    by_anchor: dict[int | None, list] = {}
+    for c in cards:
+        by_anchor.setdefault(c.message_id, []).append(c)
+    out: list[dict] = []
+    for m in msgs:
+        out.append(
             {
                 "id": m.id,
                 "role": m.role,
@@ -118,9 +185,24 @@ def conversation_messages(conversation_id: int, db: Session = Depends(get_db)):
                 "tool_calls": m.tool_calls,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
             }
-            for m in msgs
-        ]
-    )
+        )
+        for c in by_anchor.pop(m.id, []):
+            out.append({
+                "id": c.id,
+                "role": "card",
+                "content": "",
+                "card": {"kind": c.kind, "payload": c.payload},
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+            })
+    for c in [c for rest in by_anchor.values() for c in rest]:
+        out.append({
+            "id": c.id,
+            "role": "card",
+            "content": "",
+            "card": {"kind": c.kind, "payload": c.payload},
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+        })
+    return ok(out)
 
 
 @router.delete("/conversations/{conversation_id}")

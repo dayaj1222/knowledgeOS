@@ -29,10 +29,8 @@ from .models import (
     AnswerEvaluation,
     GeneratedQuestions,
     SyllabusStructure,
-    TaggingResult,
 )
 from .prompt import assemble
-from .skills import registry
 
 _model = OpenAIChatModel(
     model_name=settings.llm.model,
@@ -57,46 +55,6 @@ def parse_syllabus(syllabus_text: str) -> SyllabusStructure:
         output_type=SyllabusStructure,
     )
     return result.output
-
-
-def _tag_batch(passages: list[dict], topics: list[dict]) -> dict[int, list[int]]:
-    """One LLM call for a subset of passages → {topic_id: [passage_id, ...]}."""
-    topic_lines = "\n".join(f"- id {t['id']}: {t['name']}" for t in topics)
-    passage_lines = "\n\n".join(
-        f"PASSAGE {p['id']}:\n{p['content'][:1500]}" for p in passages
-    )
-    result = core_agent.run_sync(
-        (
-            "Assign each passage to exactly ONE topic (or none if it doesn't fit).\n\n"
-            f"TOPICS:\n{topic_lines}\n\nPASSAGES:\n{passage_lines}"
-        ),
-        deps={},
-        instructions=assemble("tag_passages"),
-        output_type=TaggingResult,
-    )
-    return dict(result.output.assignments)
-
-
-def tag_passages_to_topics(passages: list[dict], topics: list[dict]) -> dict[int, list[int]]:
-    """Match passages to topics, batched. Returns {topic_id: [passage_id, ...]}.
-
-    Splits passages into groups of settings.agent.tag_batch_size, calls the LLM
-    once per group (always with the full topic list), and merges the results —
-    avoiding the skipped/hallucinated rows a single giant call would produce.
-    """
-    if not passages or not topics:
-        return {}
-
-    batch_size = max(1, settings.agent.tag_batch_size)
-    merged: dict[int, list[int]] = {}
-
-    for i in range(0, len(passages), batch_size):
-        batch = passages[i : i + batch_size]
-        result = _tag_batch(batch, topics)
-        for topic_id, passage_ids in result.items():
-            merged.setdefault(int(topic_id), []).extend(int(p) for p in passage_ids)
-
-    return merged
 
 
 # --- Question generation + answer evaluation (typed, self-repairing) ---

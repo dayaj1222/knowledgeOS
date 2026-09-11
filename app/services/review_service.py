@@ -1,9 +1,14 @@
 """Spaced repetition service: SM-2 scheduling on the Review table.
 
-Every graded attempt and every study log feeds a quality score (0-5) into the
-topic's review schedule:
+STRICT CONTRACT (the mastery/retrieval split): this table tracks RETRIEVAL
+strength only — when to surface a topic for recall. It is fed exclusively
+by genuine recall events: graded quiz attempts ("quiz"), review-card
+self-ratings ("review"), and study sessions ("study"). Chat-demonstrated
+understanding ("chat") counts only for substantial slices (the tutor gates
+it); it never drives the schedule alone. Mastery scores live in Proficiency
++ its ledger — the two systems correlate but must not conflate.
 
-    quality = round(score_or_confidence * 5)
+Quality mapping: quality = round(score_or_confidence * 5).
 
 SM-2 update (SuperMemo-2):
   - quality < 3 → re-learn: interval resets to 1 day
@@ -72,15 +77,21 @@ class ReviewService:
     @staticmethod
     def record_result(
         db: Session, *, user_id: int, topic_id: int, quality: int,
+        source: str = "quiz",
         now: datetime | None = None,
     ) -> models.Review:
-        """Fold one recall result into the topic's SM-2 schedule (no commit)."""
+        """Fold one recall result into the topic's SM-2 schedule (no commit).
+
+        source ∈ quiz | review | study | chat — stamped on last_source so the
+        schedule's driver is always auditable (see module contract).
+        """
         now = now or datetime.now()
         review = ReviewService.get_or_create(db, user_id, topic_id)
         interval, ease = sm2_step(quality, review.interval_days, review.ease_factor)
         review.interval_days = interval
         review.ease_factor = ease
         review.due_date = now + timedelta(days=interval)
+        review.last_source = source
         db.add(review)
         return review
 

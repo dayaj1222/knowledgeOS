@@ -11,7 +11,7 @@ adding skills later is a drop-in, not a refactor.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 
 class Skill(Protocol):

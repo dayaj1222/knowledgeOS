@@ -3,14 +3,19 @@
 // prompts, and a preferences modal (system-prompt injection + tutor memory).
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   ArrowDown,
   Check,
   Copy,
+  History,
   Plus,
+  Reply,
   Search,
   Settings2,
   Sparkles,
+  Square,
+  Timer,
   Trash2,
   X,
 } from "lucide-react";
@@ -18,6 +23,8 @@ import {
   USER_ID,
   deleteConversation,
   deleteMemory,
+  getDeadlines,
+  getDueReviews,
   getMemories,
   getPreference,
   putPreference,
@@ -27,19 +34,46 @@ import { useStore } from "../store";
 import { notifyError, notifySuccess } from "../components/notifications";
 import { useChatThread, dropThreadCache } from "../components/useChatThread";
 import Markdown from "../components/Markdown";
-import InlineQuiz from "../components/InlineQuiz";
-import InlineClarify from "../components/InlineClarify";
+import TodoGraph from "../components/TodoGraph";
+import { renderCard } from "../components/cardRegistry";
+import { cardKind } from "../api";
 import ToolCalls from "../components/ToolCalls";
 import ChatComposer from "../components/ChatComposer";
 
 const SUGGESTIONS = [
   "Quiz me on my weakest topic",
-  "What should I study today?",
+  "What should I revise today?",
   "Explain the last thing I got wrong",
   "Plan my study week",
 ];
 
+// User bubble text: leading "> " quote lines (from quote-reply) render as
+// a styled quote block, the rest stays plain text.
+function UserText({ text }: { text: string }) {
+  const lines = text.split("\n");
+  const quote: string[] = [];
+  let i = 0;
+  while (i < lines.length && lines[i].startsWith("> ")) {
+    quote.push(lines[i].slice(2));
+    i++;
+  }
+  while (i < lines.length && lines[i].trim() === "") i++;
+  const rest = lines.slice(i).join("\n");
+  if (quote.length === 0) return <p className="whitespace-pre-wrap m-0">{text}</p>;
+  const flat = quote.join("\n");
+  return (
+    <>
+      <div className="rounded-lg bg-black/15 border-l-2 border-white/60 pl-2.5 pr-2 py-1 mb-1.5 text-[13px] leading-snug opacity-90 whitespace-pre-wrap">
+        {flat.slice(0, 300)}
+        {flat.length > 300 ? "…" : ""}
+      </div>
+      {rest && <p className="whitespace-pre-wrap m-0">{rest}</p>}
+    </>
+  );
+}
+
 export default function Tutor() {
+  const navigate = useNavigate();
   const {
     activeConversationId,
     setActiveConversationId,
@@ -56,6 +90,9 @@ export default function Tutor() {
     send: sendStream,
     submitQuiz,
     retry,
+    timer,
+    stopTimer,
+    todo,
   } = useChatThread();
 
   const [query, setQuery] = useState("");
@@ -64,6 +101,15 @@ export default function Tutor() {
   const [memories, setMemories] = useState<TutorMemory[]>([]);
   const [copiedId, setCopiedId] = useState<number | null>(null);
   const [historyPopupOpen, setHistoryPopupOpen] = useState(false);
+  // Quote-reply: the message being answered (quote bar above the composer).
+  const [replyTo, setReplyTo] = useState<{ id: number; role: string; text: string } | null>(null);
+  // Selection-reply: floating pill for a text snippet selected in the thread.
+  const [selMenu, setSelMenu] = useState<{ x: number; y: number; text: string; id: number; role: string } | null>(null);
+  // Quick stats bar: what's due / upcoming, tappable into agent actions.
+  const [dueCount, setDueCount] = useState(0);
+  const [deadlineCount, setDeadlineCount] = useState(0);
+  // Timer pill clock.
+  const [now, setNow] = useState(() => Date.now());
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   // Stick-to-bottom: follow only while pinned to the absolute bottom.
@@ -104,7 +150,99 @@ export default function Tutor() {
   useEffect(() => {
     stickRef.current = true;
     setAtBottom(true);
+    setReplyTo(null);
+    setSelMenu(null);
   }, [activeConversationId]);
+
+  // Quick stats: refresh on mount and after every completed turn (reviews
+  // and deadlines shift as the learner works).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [due, deadlines] = await Promise.all([
+          getDueReviews(USER_ID, 20).catch(() => []),
+          getDeadlines(USER_ID).catch(() => []),
+        ]);
+        if (!cancelled) {
+          setDueCount(due.length);
+          setDeadlineCount(deadlines.length);
+        }
+      } catch {
+        // best-effort; the bar just stays at zero
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [busy]);
+
+  // Timer pill clock (1s tick, only while a timer runs).
+  useEffect(() => {
+    if (!timer) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [timer]);
+
+  // Keyboard shortcuts: "/" focuses the composer, Escape blurs it.
+  // Clicking anywhere outside the selection pill dismisses it.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const el = document.activeElement as HTMLElement | null;
+      const typing = el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA");
+      if (e.key === "/" && !typing) {
+        e.preventDefault();
+        document.getElementById("tutor-composer")?.focus();
+      } else if (e.key === "Escape") {
+        setSelMenu(null);
+        if (typing) el?.blur();
+      }
+    }
+    function onDown(e: MouseEvent) {
+      if (!(e.target as HTMLElement).closest?.(".sel-pill")) setSelMenu(null);
+    }
+    window.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, []);
+
+  function onThreadSelect() {
+    // Read the selection after it settles; show a Reply pill attributed to
+    // the message the selection started in.
+    requestAnimationFrame(() => {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed) {
+        setSelMenu(null);
+        return;
+      }
+      const text = sel.toString().trim();
+      if (!text) {
+        setSelMenu(null);
+        return;
+      }
+      const node = sel.anchorNode as Node | null;
+      const host = (node instanceof Element ? node : node?.parentElement)?.closest?.("[data-msg-id]");
+      if (!host) {
+        setSelMenu(null);
+        return;
+      }
+      const rect = sel.getRangeAt(0).getBoundingClientRect();
+      if (rect.width < 2 && rect.height < 2) {
+        setSelMenu(null);
+        return;
+      }
+      setSelMenu({
+        x: Math.min(Math.max(rect.left + rect.width / 2, 60), window.innerWidth - 60),
+        y: Math.max(rect.top - 8, 8),
+        text: text.slice(0, 600),
+        id: Number(host.getAttribute("data-msg-id")),
+        role: host.getAttribute("data-msg-role") || "assistant",
+      });
+    });
+  }
 
   function onScroll(e: React.UIEvent<HTMLDivElement>) {
     // Absolute bottom: pinned only when truly at the end (≤4px slack).
@@ -112,6 +250,7 @@ export default function Tutor() {
     const pinned = el.scrollHeight - el.scrollTop - el.clientHeight <= 4;
     stickRef.current = pinned;
     setAtBottom((prev) => (prev === pinned ? prev : pinned));
+    setSelMenu(null); // scrolling dismisses the selection pill
   }
 
   function jumpToLatest() {
@@ -122,10 +261,31 @@ export default function Tutor() {
     else bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }
 
+  function startReply(id: number, role: string, content: string) {
+    const text = content.trim().slice(0, 600);
+    if (!text) return;
+    setReplyTo({ id, role, text });
+    document.getElementById("tutor-composer")?.focus();
+  }
+
+  function quotedSend(text: string) {
+    // Quote-reply composes a markdown blockquote above the message, so the
+    // tutor sees exactly which section is being answered (frontend-only).
+    if (!replyTo) return text;
+    const quote = replyTo.text
+      .split("\n")
+      .map((l) => `> ${l}`)
+      .join("\n");
+    return `${quote}\n\n${text}`;
+  }
+
   async function send(text: string) {
     if (!text.trim() || busy) return;
     stickRef.current = true; // own message → follow the reply
     setAtBottom(true);
+    setSelMenu(null);
+    const body = quotedSend(text);
+    setReplyTo(null);
     const cmd = text.trim().toLowerCase();
     if (cmd === "/history") {
       setHistoryPopupOpen(true);
@@ -140,11 +300,15 @@ export default function Tutor() {
       await sendStream("Generate a practice quiz for me");
       return;
     }
+    if (cmd === "/review") {
+      await sendStream("What do I have due for review? Let's revise.");
+      return;
+    }
     if (cmd === "/plan") {
       await sendStream("Build a study plan for me");
       return;
     }
-    await sendStream(text);
+    await sendStream(body);
   }
 
   async function remove(id: number) {
@@ -207,7 +371,36 @@ export default function Tutor() {
           <h1 className="text-sm font-semibold text-foreground truncate">
             {activeTitle ?? "New conversation"}
           </h1>
-          <div className="ml-auto flex items-center gap-1.5">
+          {timer && (
+            <div
+              title={timer.label}
+              className="flex items-center gap-1.5 text-xs font-mono font-semibold px-2.5 py-1.5 rounded-lg bg-accent/10 text-accent border border-accent/30 shrink-0"
+            >
+              <Timer size={13} />
+              <span>
+                {String(Math.floor((now - timer.startedAt) / 60000)).padStart(2, "0")}:
+                {String(Math.floor(((now - timer.startedAt) / 1000) % 60)).padStart(2, "0")}
+              </span>
+              <span className="font-sans font-medium max-w-32 truncate hidden sm:inline">
+                {timer.label}
+              </span>
+              <button
+                onClick={stopTimer}
+                title="Stop timer and log the session"
+                className="p-0.5 rounded hover:bg-accent/20"
+              >
+                <Square size={11} />
+              </button>
+            </div>
+          )}
+          <div className="ml-auto flex items-center gap-1.5 shrink-0">
+            <button
+              onClick={() => setHistoryPopupOpen(true)}
+              title="Chat history"
+              className="p-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted"
+            >
+              <History size={14} />
+            </button>
             <button
               onClick={openPrefs}
               title="Tutor preferences"
@@ -218,10 +411,35 @@ export default function Tutor() {
           </div>
         </div>
 
+        {(dueCount > 0 || deadlineCount > 0) && (
+          <div className="flex items-center gap-2 px-5 py-2 border-b border-border/60 text-xs">
+            {dueCount > 0 && (
+              <button
+                onClick={() => send("What do I have due for review? Let's revise.")}
+                disabled={busy}
+                className="font-semibold text-accent hover:underline disabled:opacity-50"
+              >
+                {dueCount} review{dueCount === 1 ? "" : "s"} due
+              </button>
+            )}
+            {dueCount > 0 && deadlineCount > 0 && (
+              <span className="text-muted-foreground/50">·</span>
+            )}
+            {deadlineCount > 0 && (
+              <button
+                onClick={() => navigate("/plan")}
+                className="text-muted-foreground hover:text-foreground hover:underline"
+              >
+                {deadlineCount} upcoming deadline{deadlineCount === 1 ? "" : "s"}
+              </button>
+            )}
+          </div>
+        )}
+
         <div className="relative flex-1 overflow-hidden">
           <div className="pointer-events-none absolute top-0 inset-x-0 h-6 bg-gradient-to-b from-card to-transparent z-10" />
-          <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-5 py-4 space-y-6 w-full mx-auto h-full">
-          {messages.length === 0 && (
+          <div ref={scrollRef} onScroll={onScroll} onMouseUp={onThreadSelect} onTouchEnd={onThreadSelect} className="flex-1 overflow-y-auto px-5 py-4 space-y-6 w-full mx-auto h-full">
+          {messages.filter((m) => m.role !== "todo").length === 0 && (
             <div className="py-10 text-center space-y-5">
               <div>
                 <Sparkles size={28} className="mx-auto text-accent mb-3" />
@@ -245,29 +463,18 @@ export default function Tutor() {
             </div>
           )}
 
-          {messages.map((m) => (
-            m.role === "quiz" ? (
-              <div key={m.id} className="flex justify-start">
-                <div className="w-full max-w-[92%] rounded-2xl px-4 py-3 text-sm leading-relaxed shadow-sm bg-muted border border-border rounded-bl-sm">
-                  <InlineQuiz
-                    message={m}
-                    conversationId={activeConversationId ?? 0}
-                    onFinish={submitQuiz}
-                  />
-                </div>
-              </div>
-            ) : m.role === "clarify" ? (
-              <div key={m.id} className="flex justify-start">
-                <div className="w-full max-w-[92%] rounded-2xl rounded-bl-sm px-4 py-3 shadow-sm bg-muted border border-border">
-                  <InlineClarify
-                    message={m}
-                    busy={busy}
-                    onAnswer={(a) => send(a)}
-                  />
-                </div>
-              </div>
-            ) : (
-            <div key={m.id} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+          {messages.filter((m) => m.role !== "todo" && cardKind(m) !== "todo").map((m) => {
+            const card = cardKind(m) && cardKind(m) !== "todo"
+              ? renderCard(m, {
+                  conversationId: activeConversationId ?? 0,
+                  busy,
+                  onQuizFinish: submitQuiz,
+                  onClarifyAnswer: (a) => send(a),
+                })
+              : null;
+            if (card) return card;
+            return (
+            <div key={m.id} data-msg-id={m.id} data-msg-role={m.role} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
               <div
                 className={`group/msg max-w-[75%] rounded-2xl px-4 py-3 text-sm leading-relaxed shadow-sm ${
                   m.role === "user"
@@ -276,7 +483,7 @@ export default function Tutor() {
                 }`}
               >
                 {m.role === "user" ? (
-                  <p className="whitespace-pre-wrap m-0">{m.content}</p>
+                  <UserText text={m.content} />
                 ) : (
                   <Markdown text={m.content} />
                 )}
@@ -290,28 +497,37 @@ export default function Tutor() {
                   </button>
                 )}
                 <ToolCalls calls={m.tool_calls ?? []} />
-                {m.role === "assistant" && (
-                  <div className="flex items-center gap-2 mt-2 pt-1.5 border-t border-border/40">
-                    {m.created_at && (
-                      <span className="text-[10px] font-mono text-muted-foreground/70">
-                        {new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                      </span>
+                <div className="flex items-center gap-2 mt-2 pt-1.5 border-t border-border/40">
+                  {m.created_at && (
+                    <span className="text-[10px] font-mono text-muted-foreground/70">
+                      {new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    </span>
+                  )}
+                  <span className="ml-auto flex items-center gap-1">
+                    {m.content.trim() && (
+                      <button
+                        title="Reply to this message"
+                        onClick={() => startReply(m.id, m.role, m.content)}
+                        className="opacity-0 group-hover/msg:opacity-60 hover:!opacity-100 p-0.5"
+                      >
+                        <Reply size={11} />
+                      </button>
                     )}
-                    {m.id > 0 && (
+                    {m.role === "assistant" && m.id > 0 && (
                       <button
                         title="Copy"
                         onClick={() => copy(m.content, m.id)}
-                        className="opacity-0 group-hover/msg:opacity-60 hover:!opacity-100 p-0.5 ml-auto"
+                        className="opacity-0 group-hover/msg:opacity-60 hover:!opacity-100 p-0.5"
                       >
                         {copiedId === m.id ? <Check size={11} /> : <Copy size={11} />}
                       </button>
                     )}
-                  </div>
-                )}
+                  </span>
+                </div>
               </div>
             </div>
-            )
-          ))}
+            );
+          })}
           {busy && streamText && (
             <div className="flex justify-start">
               <div className="max-w-[75%] rounded-2xl rounded-bl-sm px-4 py-3 text-sm leading-relaxed bg-muted text-foreground border border-border shadow-sm">
@@ -343,8 +559,54 @@ export default function Tutor() {
           </button>
         )}
 
+        {/* Selection-reply pill: answer just the highlighted snippet. */}
+        {selMenu && (
+          <button
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              startReply(selMenu.id, selMenu.role, selMenu.text);
+              setSelMenu(null);
+              window.getSelection()?.removeAllRanges();
+            }}
+            className="sel-pill fixed z-40 flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-full bg-primary text-white shadow-lg hover:opacity-90 transition-opacity animate-fadeIn"
+            style={{ left: selMenu.x, top: selMenu.y, transform: "translate(-50%, -100%)" }}
+          >
+            <Reply size={12} /> Reply
+          </button>
+        )}
+
+        {replyTo && (
+          <div className="mx-5 mb-2.5 flex items-start gap-2.5 rounded-xl bg-muted/60 border border-border/70 border-l-2 border-l-accent px-3 py-2 animate-fadeIn">
+            <Reply size={13} className="text-accent shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <p className="text-[10px] font-semibold uppercase tracking-wide text-accent">
+                Replying to {replyTo.role === "user" ? "you" : "tutor"}
+              </p>
+              <p className="text-xs text-muted-foreground truncate">
+                {replyTo.text.split("\n")[0].slice(0, 140)}
+                {(replyTo.text.length > 140 || replyTo.text.includes("\n")) ? "…" : ""}
+              </p>
+            </div>
+            <button
+              onClick={() => setReplyTo(null)}
+              title="Cancel reply"
+              className="p-1 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted shrink-0"
+            >
+              <X size={13} />
+            </button>
+          </div>
+        )}
         <ChatComposer busy={busy} onSend={send} />
       </div>
+
+      {/* Plan side panel: appears only while the active conversation has a
+          live todo plan (agent update_todo). Per-chat: switching threads
+          swaps to that thread's plan, or hides when it has none. */}
+      {todo && todo.todos.length > 0 && (
+        <aside className="shrink-0 w-64 max-h-[calc(100vh-3.5rem)] overflow-y-auto max-lg:fixed max-lg:right-3 max-lg:top-14 max-lg:bottom-16 max-lg:z-30 max-lg:w-72 max-lg:rounded-xl max-lg:border max-lg:border-border max-lg:bg-card max-lg:p-3 max-lg:shadow-xl">
+          <TodoGraph todo={todo} />
+        </aside>
+      )}
 
       {/* History popup */}
       {historyPopupOpen && (

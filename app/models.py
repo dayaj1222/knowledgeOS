@@ -13,7 +13,6 @@ Schema decisions applied (from review):
 from __future__ import annotations
 
 from datetime import datetime, time
-from typing import Optional
 
 from sqlalchemy import (
     JSON,
@@ -51,14 +50,14 @@ class User(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     timezone: Mapped[str] = mapped_column(String(64), default="Asia/Kolkata")
-    college: Mapped[Optional[str]] = mapped_column(String(255))
+    college: Mapped[str | None] = mapped_column(String(255))
     course_name: Mapped[str] = mapped_column(String(255), default="B.Tech CSE")
-    semester: Mapped[Optional[int]] = mapped_column(Integer)
-    location: Mapped[Optional[str]] = mapped_column(String(255))
+    semester: Mapped[int | None] = mapped_column(Integer)
+    location: Mapped[str | None] = mapped_column(String(255))
 
-    courses: Mapped[list["Course"]] = relationship(back_populates="user")
-    proficiency: Mapped[list["Proficiency"]] = relationship(back_populates="user")
-    preference: Mapped[Optional["Preference"]] = relationship(back_populates="user", uselist=False)
+    courses: Mapped[list[Course]] = relationship(back_populates="user")
+    proficiency: Mapped[list[Proficiency]] = relationship(back_populates="user")
+    preference: Mapped[Preference | None] = relationship(back_populates="user", uselist=False)
 
 
 class Course(Base, TimestampMixin):
@@ -69,17 +68,17 @@ class Course(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     code: Mapped[str] = mapped_column(String(64), nullable=False)
     type: Mapped[str] = mapped_column(String(16), default="ETH")  # TH | ETH | ELA
-    instructor: Mapped[Optional[str]] = mapped_column(String(255))
+    instructor: Mapped[str | None] = mapped_column(String(255))
     credits: Mapped[int] = mapped_column(Integer, default=3)
     status: Mapped[str] = mapped_column(
         String(16), default="not_started"
     )  # not_started | in_progress | completed
-    color: Mapped[Optional[str]] = mapped_column(String(16))
+    color: Mapped[str | None] = mapped_column(String(16))
 
-    user: Mapped["User"] = relationship(back_populates="courses")
-    modules: Mapped[list["Module"]] = relationship(back_populates="course")
-    resources: Mapped[list["Resource"]] = relationship(back_populates="course")
-    deadlines: Mapped[list["Deadline"]] = relationship(back_populates="course")
+    user: Mapped[User] = relationship(back_populates="courses")
+    modules: Mapped[list[Module]] = relationship(back_populates="course")
+    resources: Mapped[list[Resource]] = relationship(back_populates="course")
+    deadlines: Mapped[list[Deadline]] = relationship(back_populates="course")
 
 
 class Module(Base, TimestampMixin):
@@ -92,8 +91,8 @@ class Module(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     order_index: Mapped[int] = mapped_column(Integer, default=0)
 
-    course: Mapped["Course"] = relationship(back_populates="modules")
-    topics: Mapped[list["Topic"]] = relationship(back_populates="module")
+    course: Mapped[Course] = relationship(back_populates="modules")
+    topics: Mapped[list[Topic]] = relationship(back_populates="module")
 
 
 class Topic(Base, TimestampMixin):
@@ -101,25 +100,25 @@ class Topic(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     module_id: Mapped[int] = mapped_column(ForeignKey("modules.id"), nullable=False)
-    parent_topic_id: Mapped[Optional[int]] = mapped_column(
+    parent_topic_id: Mapped[int | None] = mapped_column(
         ForeignKey("topics.id"), nullable=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    description: Mapped[Optional[str]] = mapped_column(Text)  # query side for matching
+    description: Mapped[str | None] = mapped_column(Text)  # query side for matching
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     priority: Mapped[int] = mapped_column(Integer, default=3)  # 1-5 exam importance
     prerequisite_ids: Mapped[list] = mapped_column(JSON, default=list)
 
-    module: Mapped["Module"] = relationship(back_populates="topics")
-    children: Mapped[list["Topic"]] = relationship(
+    module: Mapped[Module] = relationship(back_populates="topics")
+    children: Mapped[list[Topic]] = relationship(
         back_populates="parent", remote_side=[id]
     )
-    parent: Mapped[Optional["Topic"]] = relationship(
+    parent: Mapped[Topic | None] = relationship(
         back_populates="children", remote_side=[parent_topic_id]
     )
-    questions: Mapped[list["Question"]] = relationship(back_populates="topic")
-    proficiency: Mapped[list["Proficiency"]] = relationship(back_populates="topic")
-    reviews: Mapped[list["Review"]] = relationship(back_populates="topic")
+    questions: Mapped[list[Question]] = relationship(back_populates="topic")
+    proficiency: Mapped[list[Proficiency]] = relationship(back_populates="topic")
+    reviews: Mapped[list[Review]] = relationship(back_populates="topic")
 
 
 class Proficiency(Base, TimestampMixin):
@@ -139,8 +138,8 @@ class Proficiency(Base, TimestampMixin):
         DateTime, server_default=func.now(), onupdate=func.now()
     )
 
-    user: Mapped["User"] = relationship(back_populates="proficiency")
-    topic: Mapped["Topic"] = relationship(back_populates="proficiency")
+    user: Mapped[User] = relationship(back_populates="proficiency")
+    topic: Mapped[Topic] = relationship(back_populates="proficiency")
 
 
 class Resource(Base, TimestampMixin):
@@ -152,17 +151,17 @@ class Resource(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     type: Mapped[str] = mapped_column(String(16), default="pdf")  # pdf | slides | notes
     file_path: Mapped[str] = mapped_column(String(512), nullable=False)
-    module_id: Mapped[Optional[int]] = mapped_column(ForeignKey("modules.id"), nullable=True)
+    module_id: Mapped[int | None] = mapped_column(ForeignKey("modules.id"), nullable=True)
     status: Mapped[str] = mapped_column(
         String(16), default="uploaded"
     )  # uploaded | processing | done | partial | failed
-    error: Mapped[Optional[str]] = mapped_column(String(255))
+    error: Mapped[str | None] = mapped_column(String(255))
     uploaded_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
     )
 
-    course: Mapped["Course"] = relationship(back_populates="resources")
-    passages: Mapped[list["Passage"]] = relationship(back_populates="resource")
+    course: Mapped[Course] = relationship(back_populates="resources")
+    passages: Mapped[list[Passage]] = relationship(back_populates="resource")
 
 
 class Passage(Base):
@@ -172,18 +171,21 @@ class Passage(Base):
     resource_id: Mapped[int] = mapped_column(ForeignKey("resources.id"), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     index_order: Mapped[int] = mapped_column(Integer, default=0)
-    topic_id: Mapped[Optional[int]] = mapped_column(ForeignKey("topics.id"), nullable=True)
-    page_start: Mapped[Optional[int]] = mapped_column(Integer)
-    page_end: Mapped[Optional[int]] = mapped_column(Integer)
+    topic_id: Mapped[int | None] = mapped_column(ForeignKey("topics.id"), nullable=True)
+    section_path: Mapped[str | None] = mapped_column(String(512))  # "A > B" headings
+    tag_confidence: Mapped[float | None] = mapped_column(Float)  # deterministic tag score
+    extra_topic_ids: Mapped[list] = mapped_column(JSON, default=list)  # runners-up
+    page_start: Mapped[int | None] = mapped_column(Integer)
+    page_end: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
     )
 
-    resource: Mapped["Resource"] = relationship(back_populates="passages")
-    question_links: Mapped[list["QuestionPassage"]] = relationship(
+    resource: Mapped[Resource] = relationship(back_populates="passages")
+    question_links: Mapped[list[QuestionPassage]] = relationship(
         back_populates="passage"
     )
-    notes: Mapped[list["PassageNote"]] = relationship(
+    notes: Mapped[list[PassageNote]] = relationship(
         back_populates="passage", cascade="all, delete-orphan"
     )
 
@@ -205,7 +207,7 @@ class PassageNote(Base):
         DateTime, server_default=func.now()
     )
 
-    passage: Mapped["Passage"] = relationship(back_populates="notes")
+    passage: Mapped[Passage] = relationship(back_populates="notes")
 
 
 class Question(Base, TimestampMixin):
@@ -216,11 +218,11 @@ class Question(Base, TimestampMixin):
     text: Mapped[str] = mapped_column(Text, nullable=False)
     type: Mapped[str] = mapped_column(String(16), default="mcq")  # mcq | short_answer | explain
     expected_key_points: Mapped[list] = mapped_column(JSON, default=list)
-    images: Mapped[Optional[str]] = mapped_column(String(512))  # filename(s)
-    generated_by: Mapped[Optional[str]] = mapped_column(String(64))  # model that made it
+    images: Mapped[str | None] = mapped_column(String(512))  # filename(s)
+    generated_by: Mapped[str | None] = mapped_column(String(64))  # model that made it
 
-    topic: Mapped["Topic"] = relationship(back_populates="questions")
-    passage_links: Mapped[list["QuestionPassage"]] = relationship(
+    topic: Mapped[Topic] = relationship(back_populates="questions")
+    passage_links: Mapped[list[QuestionPassage]] = relationship(
         back_populates="question"
     )
 
@@ -235,8 +237,8 @@ class QuestionPassage(Base):
         ForeignKey("passages.id"), primary_key=True
     )
 
-    question: Mapped["Question"] = relationship(back_populates="passage_links")
-    passage: Mapped["Passage"] = relationship(back_populates="question_links")
+    question: Mapped[Question] = relationship(back_populates="passage_links")
+    passage: Mapped[Passage] = relationship(back_populates="question_links")
 
 
 class Assessment(Base):
@@ -250,9 +252,9 @@ class Assessment(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
     )
-    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
 
-    questions: Mapped[list["AssessmentQuestion"]] = relationship(
+    questions: Mapped[list[AssessmentQuestion]] = relationship(
         back_populates="assessment"
     )
 
@@ -268,7 +270,7 @@ class AssessmentQuestion(Base):
     question_id: Mapped[int] = mapped_column(ForeignKey("questions.id"), nullable=False)
     order_index: Mapped[int] = mapped_column(Integer, default=0)
 
-    assessment: Mapped["Assessment"] = relationship(back_populates="questions")
+    assessment: Mapped[Assessment] = relationship(back_populates="questions")
 
 
 class Attempt(Base):
@@ -280,16 +282,16 @@ class Attempt(Base):
         ForeignKey("assessments.id"), nullable=False
     )
     question_id: Mapped[int] = mapped_column(ForeignKey("questions.id"), nullable=False)
-    user_answer: Mapped[Optional[str]] = mapped_column(Text)
+    user_answer: Mapped[str | None] = mapped_column(Text)
     score: Mapped[float] = mapped_column(Float, default=0.0)
-    feedback: Mapped[Optional[str]] = mapped_column(Text)  # LLM evaluation
+    feedback: Mapped[str | None] = mapped_column(Text)  # LLM evaluation
     matched_key_points: Mapped[list] = mapped_column(JSON, default=list)
     missed_key_points: Mapped[list] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(
         String(16), default="answered"
     )  # answered | skipped
     excluded: Mapped[bool] = mapped_column(Boolean, default=False)  # malformed flag
-    evaluated_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    evaluated_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
     )
@@ -301,14 +303,19 @@ class Preference(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
     session_length_minutes: Mapped[int] = mapped_column(Integer, default=45)
     daily_goal_minutes: Mapped[int] = mapped_column(Integer, default=180)
-    preferred_start: Mapped[Optional[time]] = mapped_column(Time)
-    preferred_end: Mapped[Optional[time]] = mapped_column(Time)
-    tutor_instructions: Mapped[Optional[str]] = mapped_column(Text)  # injected into tutor system prompt
+    preferred_start: Mapped[time | None] = mapped_column(Time)
+    preferred_end: Mapped[time | None] = mapped_column(Time)
+    tutor_instructions: Mapped[str | None] = mapped_column(Text)  # injected into tutor system prompt
+    tutor_style: Mapped[str] = mapped_column(String(16), default="balanced")  # socratic | balanced | direct | drill
+    tutor_verbosity: Mapped[str] = mapped_column(String(16), default="balanced")  # concise | balanced | detailed
+    default_quiz_count: Mapped[int] = mapped_column(Integer, default=3)  # questions per topic when the tutor omits count
+    default_difficulty: Mapped[str] = mapped_column(String(16), default="medium")  # easy | medium | hard
+    review_batch_size: Mapped[int] = mapped_column(Integer, default=8)  # max recall cards per ask_review session
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
 
-    user: Mapped["User"] = relationship(back_populates="preference")
+    user: Mapped[User] = relationship(back_populates="preference")
 
 
 class Schedule(Base):
@@ -324,7 +331,7 @@ class Schedule(Base):
         DateTime, server_default=func.now(), onupdate=func.now()
     )
 
-    slots: Mapped[list["Slot"]] = relationship(back_populates="schedule")
+    slots: Mapped[list[Slot]] = relationship(back_populates="schedule")
 
 
 class Slot(Base):
@@ -345,7 +352,7 @@ class Slot(Base):
         DateTime, server_default=func.now(), onupdate=func.now()
     )
 
-    schedule: Mapped["Schedule"] = relationship(back_populates="slots")
+    schedule: Mapped[Schedule] = relationship(back_populates="slots")
 
 
 class Deadline(Base):
@@ -354,7 +361,7 @@ class Deadline(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     course_id: Mapped[int] = mapped_column(ForeignKey("courses.id"), nullable=False)
-    topic_id: Mapped[Optional[int]] = mapped_column(ForeignKey("topics.id"))
+    topic_id: Mapped[int | None] = mapped_column(ForeignKey("topics.id"))
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     due_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     weight: Mapped[float] = mapped_column(Float, default=0.0)  # 0.0-1.0
@@ -365,7 +372,7 @@ class Deadline(Base):
         DateTime, server_default=func.now(), onupdate=func.now()
     )
 
-    course: Mapped["Course"] = relationship(back_populates="deadlines")
+    course: Mapped[Course] = relationship(back_populates="deadlines")
 
 
 class Review(Base):
@@ -377,6 +384,7 @@ class Review(Base):
     due_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     interval_days: Mapped[int] = mapped_column(Integer, default=0)
     ease_factor: Mapped[float] = mapped_column(Float, default=2.5)
+    last_source: Mapped[str | None] = mapped_column(String(32))  # what last moved the schedule
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
     )
@@ -384,7 +392,7 @@ class Review(Base):
         DateTime, server_default=func.now(), onupdate=func.now()
     )
 
-    topic: Mapped["Topic"] = relationship(back_populates="reviews")
+    topic: Mapped[Topic] = relationship(back_populates="reviews")
 
 
 class Plan(Base):
@@ -392,7 +400,7 @@ class Plan(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
-    slot_id: Mapped[Optional[int]] = mapped_column(ForeignKey("slots.id"))
+    slot_id: Mapped[int | None] = mapped_column(ForeignKey("slots.id"))
     topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id"), nullable=False)
     suggested_duration_minutes: Mapped[int] = mapped_column(Integer, default=45)
     status: Mapped[str] = mapped_column(
@@ -413,11 +421,34 @@ class StudyLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id"), nullable=False)
-    resource_id: Mapped[Optional[int]] = mapped_column(ForeignKey("resources.id"))
-    passage_id: Mapped[Optional[int]] = mapped_column(ForeignKey("passages.id"))
-    plan_id: Mapped[Optional[int]] = mapped_column(ForeignKey("plans.id"))
+    resource_id: Mapped[int | None] = mapped_column(ForeignKey("resources.id"))
+    passage_id: Mapped[int | None] = mapped_column(ForeignKey("passages.id"))
+    plan_id: Mapped[int | None] = mapped_column(ForeignKey("plans.id"))
     minutes_spent: Mapped[int] = mapped_column(Integer, default=0)
-    confidence_after: Mapped[Optional[float]] = mapped_column(Float)  # 0.0-1.0
+    confidence_after: Mapped[float | None] = mapped_column(Float)  # 0.0-1.0
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+
+
+class ProficiencyEvent(Base):
+    """Ledger: every proficiency write, who/why, old → new. The answer to
+    'why is my score X?' Sources: quiz_attempt | chat_understanding |
+    study_log | manual_override. Retrieval scheduling (SM-2) reads recall
+    events, never this table — mastery and retrieval stay separate."""
+
+    __tablename__ = "proficiency_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id"), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    old_score: Mapped[float] = mapped_column(Float, default=0.0)
+    new_score: Mapped[float] = mapped_column(Float, default=0.0)
+    observed: Mapped[float] = mapped_column(Float, default=0.0)  # evidence value
+    alpha: Mapped[float] = mapped_column(Float, default=0.0)  # blend weight used
+    ref_id: Mapped[int | None] = mapped_column(Integer)  # attempt/log id, if any
+    evidence: Mapped[str | None] = mapped_column(String(300))
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
     )
@@ -432,7 +463,7 @@ class Conversation(Base, TimestampMixin):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     title: Mapped[str] = mapped_column(String(255), default="Tutor chat")
 
-    messages: Mapped[list["ChatMessage"]] = relationship(
+    messages: Mapped[list[ChatMessage]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan"
     )
 
@@ -448,13 +479,38 @@ class ChatMessage(Base):
     )
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    tool_calls: Mapped[Optional[list]] = mapped_column(JSON)
+    tool_calls: Mapped[list | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
     )
 
-    conversation: Mapped["Conversation"] = relationship(
+    conversation: Mapped[Conversation] = relationship(
         back_populates="messages"
+    )
+
+
+class Card(Base):
+    """Inline UI card: quiz | clarify | review | todo | video.
+
+    One row per card, created right after its turn's assistant message
+    (id order == display order). payload is validated against the card
+    schema in app/agent/cards.py. Replaces the legacy role='quiz'|... hack
+    of smuggling payloads through ChatMessage.tool_calls.
+    """
+
+    __tablename__ = "cards"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("conversations.id"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    message_id: Mapped[int | None] = mapped_column(
+        ForeignKey("chat_messages.id"), nullable=True
+    )  # assistant message this card follows (display anchor)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
     )
 
 

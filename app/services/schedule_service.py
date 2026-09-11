@@ -1,42 +1,44 @@
 """Study-plan scheduler service: deterministic, explainable topic scoring.
 
-Study need for a topic is a weighted sum of three signals:
+Study need for a topic is a weighted sum of three signals (weights live in
+config [scheduler], tunable without code edits):
 
-    need = W_PROF * (1 - proficiency_score)   # low mastery -> study more
-         + W_PRIO * (priority / 5.0)          # exam importance 1..5, normalized
-         + W_DEAD * deadline_pressure         # near/weighted due dates
+    need = w_prof * (1 - proficiency_score)   # low mastery -> study more
+         + w_prio * (priority / 5.0)          # exam importance 1..5, normalized
+         + w_dead * deadline_pressure         # near/weighted due dates
 
-    deadline_pressure = max(weight * DEADLINE_CAP / days_until_due, 0)
-      - `weight` is Deadline.weight (0..1, importance of that deadline)
-      - days_until_due = (due_date - now).days, minimum 1 day
-      - past deadlines contribute 0 (already overdue -> no "pressure" signal)
-
-Topics with no Proficiency row are treated as score=0.0 (weakest).
-No ML involved; weights are tuned so a mastered low-priority topic always
-ranks below a weak high-priority one.
+Every scored topic carries human-readable reasons ("weak mastery 0.31",
+"exam 'CAT-2' in 6d") so plans are trusted, not just followed. Topics with
+no Proficiency row are treated as score=0.0 (weakest).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..config import settings
 from ._helpers import get_or_404
 
-W_PROF = 0.5
-W_PRIO = 0.25
-W_DEAD = 0.25
-DEADLINE_CAP = 7.0  # pressure saturates for anything due within a week
+
+@dataclass
+class TopicScore:
+    topic: models.Topic
+    need: float
+    reasons: list[str] = field(default_factory=list)
+    components: dict[str, float] = field(default_factory=dict)
 
 
 class ScheduleService:
     @staticmethod
     def deadline_pressure_by_topic(
         db: Session, user_id: int, now: datetime
-    ) -> dict[int, float]:
+    ) -> tuple[dict[int, float], dict[int, list[models.Deadline]]]:
+        """Pressure per topic + the live deadlines behind it (for reasons)."""
         deadlines = db.scalars(
             select(models.Deadline).where(models.Deadline.user_id == user_id)
         ).all()
@@ -53,39 +55,69 @@ class ScheduleService:
             t.id: t.module.course_id for t in topics if t.module is not None
         }
 
+        cap = settings.scheduler.deadline_cap
         pressure: dict[int, float] = {}
+        drivers: dict[int, list[models.Deadline]] = {}
         for dl in deadlines:
             if days_left[dl.id] <= 0.0:
                 continue
-            p = dl.weight * DEADLINE_CAP / days_left[dl.id]
+            p = dl.weight * cap / days_left[dl.id]
             if dl.topic_id is not None:
                 pressure[dl.topic_id] = pressure.get(dl.topic_id, 0.0) + p
+                drivers.setdefault(dl.topic_id, []).append(dl)
             else:
                 for tid, cid in topic_course.items():
                     if cid == dl.course_id:
                         pressure[tid] = pressure.get(tid, 0.0) + p
-        return pressure
+                        drivers.setdefault(tid, []).append(dl)
+        return pressure, drivers
 
     @staticmethod
-    def score_topics(db: Session, user_id: int, now: datetime) -> list[tuple[float, models.Topic]]:
-        """Score every schedulable topic by study need, highest first."""
-        pressure = ScheduleService.deadline_pressure_by_topic(db, user_id, now)
+    def score_topics(db: Session, user_id: int, now: datetime) -> list[TopicScore]:
+        """Score every schedulable topic by study need, highest first.
+
+        Each item carries human-readable reasons so plans explain themselves.
+        """
+        cfg = settings.scheduler
+        pressure, drivers = ScheduleService.deadline_pressure_by_topic(db, user_id, now)
         profs = db.scalars(
             select(models.Proficiency).where(models.Proficiency.user_id == user_id)
         ).all()
         prof_by_topic = {p.topic_id: p.score for p in profs}
 
-        scored: list[tuple[float, models.Topic]] = []
+        scored: list[TopicScore] = []
         for topic in db.scalars(select(models.Topic)).all():
             if topic.module is None:
                 continue  # only topics linked to a course are schedulable
-            need = (
-                W_PROF * (1.0 - prof_by_topic.get(topic.id, 0.0))
-                + W_PRIO * (topic.priority / 5.0)
-                + W_DEAD * pressure.get(topic.id, 0.0)
-            )
-            scored.append((need, topic))
-        scored.sort(key=lambda pair: pair[0], reverse=True)
+            mastery = prof_by_topic.get(topic.id)
+            mastery_part = cfg.w_prof * (1.0 - (mastery if mastery is not None else 0.0))
+            prio_part = cfg.w_prio * (topic.priority / 5.0)
+            dead_part = cfg.w_dead * pressure.get(topic.id, 0.0)
+            need = mastery_part + prio_part + dead_part
+
+            reasons: list[str] = []
+            if mastery is None:
+                reasons.append("not yet attempted")
+            elif mastery < 0.5:
+                reasons.append(f"weak mastery {mastery:.2f}")
+            else:
+                reasons.append(f"solid mastery {mastery:.2f}")
+            if topic.priority >= 4:
+                reasons.append(f"high exam priority {topic.priority}/5")
+            for dl in drivers.get(topic.id, [])[:2]:
+                days = max((dl.due_date - now).days, 1)
+                reasons.append(f"exam '{dl.title}' in {days}d")
+            scored.append(TopicScore(
+                topic=topic,
+                need=round(need, 4),
+                reasons=reasons,
+                components={
+                    "mastery": round(mastery_part, 4),
+                    "priority": round(prio_part, 4),
+                    "deadline": round(dead_part, 4),
+                },
+            ))
+        scored.sort(key=lambda s: s.need, reverse=True)
         return scored
 
     @staticmethod
@@ -126,14 +158,14 @@ class ScheduleService:
         )
 
         plans: list[models.Plan] = []
-        for _need, topic in scored:
+        for item in scored:
             if not free_slots:
                 break
             slot = free_slots.pop(0)
             plan = models.Plan(
                 user_id=user_id,
                 slot_id=slot.id,
-                topic_id=topic.id,
+                topic_id=item.topic.id,
                 suggested_duration_minutes=session_length,
                 status="pending",
             )

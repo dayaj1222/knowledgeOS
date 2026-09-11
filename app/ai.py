@@ -18,7 +18,13 @@ import httpx
 
 LLM_BASE_URL = os.environ.get("KB_LLM_BASE_URL", "http://127.0.0.1:9173/v1")
 LLM_MODEL = os.environ.get("KB_LLM_MODEL", "EXPERT")
+LLM_API_KEY = os.environ.get("KB_LLM_API_KEY", "")
 _HTTP_TIMEOUT = 300.0  # local model can be slow
+
+
+def _auth_headers() -> dict:
+    """Bearer token for real OpenAI-compatible APIs; empty for the local proxy."""
+    return {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
 
 # thread_id is a proxy-only extension (real OpenAI rejects unknown fields
 # with 400). Auto-send it only to the local proxy; override with
@@ -81,13 +87,16 @@ async def chat_with_tools(
     if tid:
         payload["thread_id"] = tid
     async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-        r = await client.post(f"{LLM_BASE_URL}/chat/completions", json=payload)
+        r = await client.post(
+            f"{LLM_BASE_URL}/chat/completions", json=payload,
+            headers=_auth_headers(),
+        )
         if r.status_code == 400 and tid:
             # Strict server rejected the proxy-only field — latch off and
             # retry once without it.
             _THREAD_OK = False
             del payload["thread_id"]
-            r = await client.post(f"{LLM_BASE_URL}/chat/completions", json=payload)
+            r = await client.post(f"{LLM_BASE_URL}/chat/completions", json=payload, headers=_auth_headers())
         r.raise_for_status()
         data = r.json()
         return data["choices"][0]["message"]
@@ -119,7 +128,8 @@ async def chat_stream(messages: list[dict], tools: list[dict] | None = None,
     pending: dict[int, dict] = {}
     async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
         async with client.stream(
-            "POST", f"{LLM_BASE_URL}/chat/completions", json=payload
+            "POST", f"{LLM_BASE_URL}/chat/completions", json=payload,
+            headers=_auth_headers(),
         ) as r:
             r.raise_for_status()
             async for line in r.aiter_lines():

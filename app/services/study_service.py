@@ -11,10 +11,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..config import settings
+from .proficiency_service import STUDY_LOG, ProficiencyService
 from .review_service import ReviewService, score_to_quality
-
-#: Weight given to self-reported confidence vs stored score per log entry.
-CONFIDENCE_ALPHA = 0.15
 
 
 class StudyService:
@@ -42,30 +41,23 @@ class StudyService:
         db.add(log)
 
         if confidence_after is not None:
-            prof = db.scalar(
-                select(models.Proficiency).where(
-                    models.Proficiency.user_id == user_id,
-                    models.Proficiency.topic_id == topic_id,
-                )
+            db.flush()  # log.id must exist for the ledger ref
+            ProficiencyService.record(
+                db,
+                user_id=user_id,
+                topic_id=topic_id,
+                observed=confidence_after,
+                alpha=settings.proficiency.study_alpha,
+                source=STUDY_LOG,
+                ref_id=log.id,
             )
-            if prof is None:
-                prof = models.Proficiency(
-                    user_id=user_id, topic_id=topic_id, score=confidence_after
-                )
-                db.add(prof)
-            else:
-                prof.score = round(
-                    (1 - CONFIDENCE_ALPHA) * prof.score
-                    + CONFIDENCE_ALPHA * confidence_after,
-                    4,
-                )
-                db.add(prof)
             # A study session is also a recall event for the schedule.
             ReviewService.record_result(
                 db,
                 user_id=user_id,
                 topic_id=topic_id,
                 quality=score_to_quality(confidence_after),
+                source="study",
             )
 
         # Completing a log against a plan marks that plan done.

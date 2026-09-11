@@ -11,23 +11,78 @@ import re
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 
 from .. import models
+from ..config import settings
 from ..services import (
+    CHAT_UNDERSTANDING,
     CourseService,
+    ProficiencyService,
     QuizService,
     ReviewService,
     ScheduleService,
     StudyService,
 )
 from ..services.review_service import score_to_quality
+from .web import fetch_transcript as _fetch_transcript
 from .web import fetch_url as _fetch_url
+from .web import score_relevance as _score_relevance
+from .web import search_videos as _search_videos
 from .web import search_web as _search_web
 
 
 def _needs_confirmation(action: str, params: dict) -> dict:
     return {"needs_confirmation": True, "action": action, "params": params}
+
+
+# ---------- typed args (runtime validation at dispatch) ----------
+# NOTE: these mirror runtime behavior (defaults, coercions), NOT the
+# aspirational hand-written JSON schemas in TOOLS (which carry richer
+# per-field docs for the model). A test locks field parity so they can't
+# drift apart silently. New tools MUST declare an args model.
+
+
+class RecordUnderstandingArgs(BaseModel):
+    topic_id: int
+    demonstrated: float = 0.8
+    coverage: float = 0.2
+    evidence: str = ""
+    confirmed: bool = False
+
+
+class UpdateTodoArgs(BaseModel):
+    todos: list[dict]
+    confirmed: bool = False
+
+
+class GenerateQuizArgs(BaseModel):
+    topic_ids: list[int] = Field(default_factory=list)
+    count_per_topic: int | None = None
+    difficulty: str | None = None
+    confirmed: bool = False
+
+
+class AskClarifyArgs(BaseModel):
+    question: str = ""
+    options: list[str] = Field(default_factory=list)
+    allow_free_text: bool = True
+
+
+class AskReviewArgs(BaseModel):
+    items: list[dict]
+
+
+class FindVideosArgs(BaseModel):
+    query: str
+    count: int | None = None
+    topic_id: int | None = None
+
+
+class StartTimerArgs(BaseModel):
+    topic_id: int
+    label: str = ""
 
 
 # ---------- read-only ----------
@@ -69,22 +124,69 @@ def list_courses(db, user_id: int, args: dict) -> list[dict]:
     return [{"id": c.id, "name": c.name, "code": c.code} for c in courses]
 
 
-def list_modules(db, user_id: int, args: dict) -> list[dict]:
-    mods = db.scalars(
-        select(models.Module).where(
-            models.Module.course_id == int(args["course_id"])
-        )
+def course_tree(db, user_id: int, course_id: int) -> dict | None:
+    """Full course structure in one shot: modules with nested topics, each
+    topic carrying its id, proficiency score, and passage count. Shared by
+    the get_course_tree tool and the per-turn snapshot injection."""
+    course = db.get(models.Course, course_id)
+    if course is None or course.user_id != user_id:
+        return None
+    scores = {
+        r.topic_id: round(r.score, 2)
+        for r in db.scalars(
+            select(models.Proficiency).where(models.Proficiency.user_id == user_id)
+        ).all()
+    }
+    counts = dict(
+        db.execute(
+            select(models.Passage.topic_id, func.count(models.Passage.id))
+            .join(models.Resource, models.Passage.resource_id == models.Resource.id)
+            .where(models.Resource.user_id == user_id)
+            .group_by(models.Passage.topic_id)
+        ).all()
+    )
+    modules = db.scalars(
+        select(models.Module)
+        .where(models.Module.course_id == course_id)
+        .order_by(models.Module.order_index, models.Module.id)
     ).all()
-    return [{"id": m.id, "name": m.name} for m in mods]
+    out_modules = []
+    for m in modules:
+        topics = db.scalars(
+            select(models.Topic)
+            .where(models.Topic.module_id == m.id)
+            .order_by(models.Topic.order_index, models.Topic.id)
+        ).all()
+        out_modules.append(
+            {
+                "id": m.id,
+                "name": m.name,
+                "topics": [
+                    {
+                        "id": t.id,
+                        "name": t.name,
+                        "score": scores.get(t.id),
+                        "passages": counts.get(t.id, 0),
+                    }
+                    for t in topics
+                ],
+            }
+        )
+    return {"id": course.id, "name": course.name, "code": course.code, "modules": out_modules}
 
 
-def list_topics(db, user_id: int, args: dict) -> list[dict]:
-    topics = db.scalars(
-        select(models.Topic).where(
-            models.Topic.module_id == int(args["module_id"])
-        )
-    ).all()
-    return [{"id": t.id, "name": t.name} for t in topics]
+def get_course_tree(db, user_id: int, args: dict) -> dict:
+    """One call for the full picture: modules with nested topics (ids,
+    proficiency scores, passage counts). Replaces the old
+    list_courses → list_modules → list_topics chain."""
+    try:
+        course_id = int(args["course_id"])
+    except (TypeError, ValueError, KeyError):
+        return {"error": "course_id (int) required — use list_courses to find it"}
+    tree = course_tree(db, user_id, course_id)
+    if tree is None:
+        return {"error": f"course {args.get('course_id')} not found"}
+    return tree
 
 
 def get_passages(db, user_id: int, args: dict) -> list[dict]:
@@ -96,7 +198,7 @@ def get_passages(db, user_id: int, args: dict) -> list[dict]:
         .limit(limit)
     ).all()
     return [
-        {"id": p.id, "pages": [p.page_start, p.page_end], "content": p.content[:1200]}
+        {"id": p.id, "pages": [p.page_start, p.page_end], "section": p.section_path, "content": p.content[:1200]}
         for p in passages
     ]
 
@@ -239,6 +341,72 @@ def fetch_url(db, user_id: int, args: dict) -> dict:
     return _fetch_url(url, max_chars)
 
 
+def find_videos(db, user_id: int, args: dict) -> dict:
+    """Find YouTube videos for a topic — renders INLINE as embedded players.
+    No confirmation needed. Max 3 per call.
+
+    Pass topic_id to VERIFY each video: its caption track is fetched and
+    scored against the topic's own passages (keyword overlap). Verified
+    videos genuinely cover the topic; the rest are flagged, not dropped —
+    the tutor presents verified ones first and says so.
+    """
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return {"error": "query must be non-empty (topic + concept, e.g. 'priority ceiling protocol explained')"}
+    try:
+        count = max(1, min(int(args.get("count", 3)), 5))
+    except (TypeError, ValueError):
+        count = 3
+    result = _search_videos(query, count)
+    videos = result.get("videos", [])
+    if not videos:
+        return {"videos": [], "hint": "No videos found — teach from passages instead."}
+    # Verification: caption track vs the topic's own text.
+    topic_text = ""
+    topic_name = ""
+    try:
+        topic_id = int(args.get("topic_id")) if args.get("topic_id") is not None else None
+    except (TypeError, ValueError):
+        topic_id = None
+    if topic_id is not None:
+        topic = db.get(models.Topic, topic_id)
+        if topic is not None:
+            topic_name = topic.name or ""
+            parts = [topic_name, topic.description or ""]
+            for p in db.scalars(
+                select(models.Passage)
+                .where(models.Passage.topic_id == topic_id)
+                .order_by(models.Passage.index_order)
+                .limit(6)
+            ).all():
+                parts.append((p.content or "")[:800])
+            topic_text = "\n".join(parts)
+    for v in videos:
+        v["verified"] = False
+        v["relevance"] = 0.0
+        if not topic_text:
+            continue
+        tr = _fetch_transcript(v["video_id"])
+        if tr.get("error") or not tr.get("full_text"):
+            v["verify_note"] = tr.get("error", "no transcript")[:120]
+            continue
+        scored = _score_relevance(tr["full_text"], topic_text, topic_name)
+        v["relevance"] = scored["relevance"]
+        v["matched"] = scored["matched"]
+        v["verified"] = scored["relevance"] >= 0.3
+    videos.sort(key=lambda v: (v["verified"], v["relevance"]), reverse=True)
+    return {
+        "type": "video",
+        "videos": videos,
+        "hint": (
+            "These render INLINE as embedded players. Present VERIFIED videos "
+            "first (their captions match the syllabus); say plainly when one "
+            "is unverified. Introduce in 1-2 sentences (which video covers "
+            "what), then end with: VIDEO_READY — do NOT paste raw URLs."
+        ),
+    }
+
+
 # ---------- mutating (confirm-in-chat) ----------
 
 def create_module(db, user_id: int, args: dict) -> dict:
@@ -269,8 +437,12 @@ def create_topic(db, user_id: int, args: dict) -> dict:
 
 async def generate_quiz(db, user_id: int, args: dict) -> dict:
     topic_ids = [int(t) for t in args.get("topic_ids", [])]
-    count = min(int(args.get("count_per_topic", 3)), 10)
-    difficulty = str(args.get("difficulty", "medium"))
+    # Omitted count/difficulty fall back to the user's Practice settings.
+    pref = db.get(models.Preference, user_id)
+    default_count = pref.default_quiz_count if pref and pref.default_quiz_count else 3
+    default_diff = (pref.default_difficulty if pref and pref.default_difficulty else "medium")
+    count = min(int(args.get("count_per_topic", default_count)), 10)
+    difficulty = str(args.get("difficulty", default_diff))
     if not args.get("confirmed"):
         return _needs_confirmation(
             f"Generate {count} {difficulty} question(s) each for topics {topic_ids}", dict(args)
@@ -399,49 +571,226 @@ def ask_clarify(db, user_id: int, args: dict) -> dict:
     }
 
 
+def ask_review(db, user_id: int, args: dict) -> dict:
+    """Run a spaced-repetition recall session — renders INLINE as flip cards
+    (recall prompt → reveal key points → self-rate). No confirmation needed.
+
+    items: [{topic_id, prompt, key_points[]}] — build ONE per due topic from
+    get_due_reviews, with the prompt + key points grounded in that topic's
+    passages. Max 8 items per session.
+    """
+    raw = args.get("items") or []
+    # Cap the session at the user's Practice setting (default 8).
+    pref = db.get(models.Preference, user_id)
+    batch = pref.review_batch_size if pref and pref.review_batch_size else 8
+    batch = max(1, min(int(batch), 15))
+    items = []
+    for it in raw[:batch]:
+        if not isinstance(it, dict):
+            continue
+        try:
+            topic_id = int(it.get("topic_id"))
+        except (TypeError, ValueError):
+            continue
+        topic = db.get(models.Topic, topic_id)
+        if topic is None:
+            continue
+        prompt = str(it.get("prompt", "")).strip()[:500]
+        key_points = [str(k).strip()[:300] for k in (it.get("key_points") or [])]
+        key_points = [k for k in key_points if k][:6]
+        if not prompt or not key_points:
+            continue
+        items.append({
+            "topic_id": topic_id,
+            "topic_name": topic.name,
+            "prompt": prompt,
+            "key_points": key_points,
+        })
+    if not items:
+        return {"error": "items must be non-empty: [{topic_id, prompt, key_points[]}] with grounded content"}
+    return {
+        "type": "review",
+        "items": items,
+        "hint": (
+            "This renders INLINE as recall flip cards; each card self-grades "
+            "straight into the SM-2 schedule. Introduce the session briefly "
+            "(1-2 sentences), then end with: REVIEW_READY — do NOT paste the "
+            "prompts or key points in text."
+        ),
+    }
+
+
+def start_timer(db, user_id: int, args: dict) -> dict:
+    """Start a study timer — renders as a live pill in the tutor header.
+    The learner stops it when done; stopping auto-logs the study session.
+    No confirmation needed. One active timer at a time."""
+    try:
+        topic_id = int(args["topic_id"])
+    except (TypeError, ValueError, KeyError):
+        return {"error": "topic_id (int) required"}
+    topic = db.get(models.Topic, topic_id)
+    if topic is None:
+        return {"error": f"topic {args.get('topic_id')} not found"}
+    label = str(args.get("label", "")).strip()[:120] or topic.name
+    return {
+        "type": "timer",
+        "action": "start",
+        "topic_id": topic_id,
+        "topic_name": topic.name,
+        "label": label,
+        "hint": (
+            "A live timer pill starts in the header. Say what to focus on in "
+            "1-2 sentences, then end with: TIMER_STARTED — the learner stops "
+            "it when done and the session logs automatically."
+        ),
+    }
+
+
+def stop_timer(db, user_id: int, args: dict) -> dict:
+    """Stop the active study timer from chat ('I'm done', 'stop the timer').
+    The frontend logs the elapsed session automatically. No confirmation."""
+    return {
+        "type": "timer",
+        "action": "stop",
+        "hint": (
+            "The timer pill stops and the session logs. Acknowledge briefly "
+            "(1-2 sentences), then end with: TIMER_STOPPED."
+        ),
+    }
+
+
+def update_todo(db, user_id: int, args: dict) -> dict:
+    """Standard agent todo list — plan tracking for multi-step work.
+
+    Call with the FULL list every time (not deltas): create the plan on the
+    first step, then re-call with updated statuses as each step completes.
+    Exactly ONE item may be in_progress; mark others pending/completed.
+    No confirmation needed. Renders as a progress graph in the side panel.
+
+    SESSION WORKFLOW (topic study): at the start of topic work, decompose
+    the topic into one item per subtopic, each with a weight (share of the
+    whole topic, weights normalized to sum 1.0; omit for equal shares).
+    As each subtopic completes, score it with record_understanding using
+    coverage = that item's weight — topic mastery is then the fair sum of
+    weight × demonstrated over subtopics, so one slice can never swamp
+    the whole score.
+    """
+    raw = args.get("todos") or []
+    if not isinstance(raw, list) or not raw:
+        return {"error": "todos must be a non-empty list: [{content, status, activeForm?, weight?}]"}
+    items = []
+    for it in raw[:20]:
+        if not isinstance(it, dict):
+            continue
+        content = str(it.get("content", "")).strip()[:200]
+        status = str(it.get("status", "pending")).strip().lower()
+        if not content or status not in ("pending", "in_progress", "completed"):
+            continue
+        active = str(it.get("activeForm", "")).strip()[:200] or content
+        try:
+            weight = max(0.0, float(it.get("weight", 0.0)))
+        except (TypeError, ValueError):
+            weight = 0.0
+        items.append({"content": content, "status": status, "activeForm": active, "weight": weight})
+    if not items:
+        return {"error": "no valid items (need content + status pending|in_progress|completed)"}
+    if sum(1 for i in items if i["status"] == "in_progress") > 1:
+        return {"error": "only ONE item may be in_progress — set the rest to pending/completed"}
+    # Normalize shares: explicit weights scale to 1.0, otherwise equal splits.
+    given = sum(i["weight"] for i in items)
+    if given > 0:
+        items = [{**i, "weight": round(i["weight"] / given, 4)} for i in items]
+    else:
+        items = [{**i, "weight": round(1.0 / len(items), 4)} for i in items]
+    done = sum(1 for i in items if i["status"] == "completed")
+    current = next((i for i in items if i["status"] == "in_progress"), None)
+    return {
+        "type": "todo",
+        "todos": items,
+        "total": len(items),
+        "completed": done,
+        "current": current["content"] if current else None,
+        "current_active": current["activeForm"] if current else None,
+        "hint": (
+            "The side panel renders this as a progress graph. When a "
+            "subtopic step completes, score it with record_understanding "
+            "using coverage = that step's weight. Keep teaching in the reply "
+            "text; never paste the todo list as text."
+        ),
+    }
+
+
 #: Weight for chat-demonstrated understanding vs stored score per event.
-LEARN_ALPHA = 0.2
+#: Configured (proficiency.chat_alpha) so tuning never edits call sites.
+LEARN_ALPHA = settings.proficiency.chat_alpha
+
+#: Conservative default when the model omits coverage: a single chat answer
+#: is one check question, a small slice of the whole topic — never the whole.
+DEFAULT_COVERAGE = 0.2
+
+#: Minimum coverage for a chat event to also count as an SM-2 recall event.
+#: Nailing one subtopic must not push the whole topic's review schedule out.
+REVIEW_MIN_COVERAGE = 0.5
 
 
 def record_understanding(db, user_id: int, args: dict) -> dict:
     """Record understanding the learner demonstrated IN CHAT (a correct
     explanation, a good paraphrase, a right answer to a check question).
-    Bumps proficiency immediately — no confirmation, never announced."""
+    Bumps proficiency immediately — no confirmation, never announced.
+
+    Topic mastery from one slice = coverage * demonstrated: e.g. 0.85 on one
+    subtopic of five (coverage 0.2) is 0.17 of the whole topic, not 0.85.
+    Fresh topics start at demonstrated * coverage. Existing topics move a
+    damped step toward demonstrated, scaled by coverage, so a slice nudges
+    instead of jumping:
+        score += LEARN_ALPHA * coverage * (demonstrated - score)
+    """
     try:
         topic_id = int(args["topic_id"])
         demonstrated = max(0.0, min(1.0, float(args.get("demonstrated", 0.8))))
+        coverage = max(0.0, min(1.0, float(args.get("coverage", DEFAULT_COVERAGE))))
     except (TypeError, ValueError, KeyError):
         return {"error": "topic_id (int) and demonstrated (0.0-1.0) required"}
+    if coverage <= 0:
+        return {"error": "coverage must be > 0 (what fraction of the topic did this cover?)"}
     evidence = str(args.get("evidence", ""))[:300]
     topic = db.get(models.Topic, topic_id)
     if topic is None:
         return {"error": f"topic {topic_id} not found"}
-    prof = db.scalar(
-        select(models.Proficiency).where(
-            models.Proficiency.user_id == user_id,
-            models.Proficiency.topic_id == topic_id,
-        )
+    alpha_eff = LEARN_ALPHA * coverage
+    prof, _event = ProficiencyService.record(
+        db,
+        user_id=user_id,
+        topic_id=topic_id,
+        observed=demonstrated,
+        alpha=alpha_eff,
+        source=CHAT_UNDERSTANDING,
+        evidence=f"coverage={coverage} {evidence}".strip(),
+        fresh_value=demonstrated * coverage,
     )
-    if prof is None:
-        prof = models.Proficiency(
-            user_id=user_id, topic_id=topic_id, score=round(demonstrated, 4)
+    # Demonstrating recall counts for the SM-2 schedule only when a
+    # substantial slice was tested — a single check question must not push
+    # the whole topic's review date out.
+    sm2_updated = False
+    if coverage >= REVIEW_MIN_COVERAGE:
+        ReviewService.record_result(
+            db, user_id=user_id, topic_id=topic_id,
+            quality=score_to_quality(demonstrated),
+            source="chat",
         )
-        db.add(prof)
-    else:
-        prof.score = round(
-            (1 - LEARN_ALPHA) * prof.score + LEARN_ALPHA * demonstrated, 4
-        )
-        db.add(prof)
-    # Demonstrating recall is also a recall event for the SM-2 schedule.
-    ReviewService.record_result(
-        db, user_id=user_id, topic_id=topic_id,
-        quality=score_to_quality(demonstrated),
-    )
+        sm2_updated = True
     if evidence and prof.strengths is not None and evidence not in (prof.strengths or []):
         prof.strengths = ([*(prof.strengths or []), evidence])[:8]
         db.add(prof)
     db.commit()
-    return {"recorded": True, "topic_id": topic_id, "score": round(prof.score, 2)}
+    return {
+        "recorded": True,
+        "topic_id": topic_id,
+        "score": round(prof.score, 2),
+        "observed": round(demonstrated * coverage, 2),
+        "coverage": coverage,
+        "sm2_updated": sm2_updated,
+    }
 
 
 # ---------- direct database access (the "modify db directly" power) ----------
@@ -527,10 +876,9 @@ TOOLS: dict[str, dict[str, Any]] = {
     "ui_command": {
         "signature": '(action: str, params?: object)',
         "description": (
-            "Send a command to the app UI. Actions: open_quiz {assessment_id, questions?} "
-            "to open a generated quiz in the player (assessment_id is durable and refresh-safe; "
-            "include questions too as instant prefill); navigate {route: /library | /plan | /quiz | /settings | /tutor} ; "
+            "Send a command to the app UI. Actions: navigate {route: / | /library | /plan | /settings} ; "
             "select_course {course_id}; reload {} to refresh sidebar data; notify {message} for a toast. "
+            "Quizzes and reviews render INLINE in the chat — never navigate away for them. "
             "Navigation only — never needs confirmation. Call it AFTER the data tool succeeds."
         ),
         "parameters": {"type": "object", "properties": {"action": {"type": "string"}, "params": {"type": "object"}}, "required": ["action"]},
@@ -562,23 +910,41 @@ TOOLS: dict[str, dict[str, Any]] = {
         "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer"}}, "required": ["url"]},
         "run": fetch_url,
     },
+    "find_videos": {
+        "signature": '(query: str, count?: int, topic_id?: int)',
+        "description": (
+            "Find YouTube videos for a topic — renders INLINE as embedded "
+            "players in the chat (thumbnail → click to play). Pass topic_id "
+            "to VERIFY each video against the topic's passages (caption-track "
+            "overlap; verified ones genuinely cover the syllabus). Use when "
+            "the learner is stuck after explanations, asks for a video/visual, "
+            "or a concept cries out for animation (protocols, algorithms, "
+            "waveforms). Query with topic + concept words. Max 3-5 per call. "
+            "No confirmation needed. Videos supplement the stored passages, "
+            "never replace them — say which part each covers."
+        ),
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "count": {"type": "integer"}, "topic_id": {"type": "integer"}}, "required": ["query"]},
+        "run": find_videos,
+        "args_model": FindVideosArgs,
+    },
     "list_courses": {
         "signature": '()',
         "description": "List the learner's courses (id, name, code).",
         "parameters": {"type": "object", "properties": {}},
         "run": list_courses,
     },
-    "list_modules": {
+    "get_course_tree": {
         "signature": '(course_id: int)',
-        "description": "List modules of a course.",
+        "description": (
+            "Full course structure in ONE call: modules with nested topics, "
+            "each topic carrying its id, proficiency score, and passage "
+            "count. Hierarchy is Course > Module > Topic. Quiz, passage, "
+            "review, and timer tools all take topic_id — module_id is only "
+            "for create_topic. Prefer the per-turn snapshot tree when it "
+            "covers the course you need; call this when it doesn't."
+        ),
         "parameters": {"type": "object", "properties": {"course_id": {"type": "integer"}}, "required": ["course_id"]},
-        "run": list_modules,
-    },
-    "list_topics": {
-        "signature": '(module_id: int)',
-        "description": "List topics of a module.",
-        "parameters": {"type": "object", "properties": {"module_id": {"type": "integer"}}, "required": ["module_id"]},
-        "run": list_topics,
+        "run": get_course_tree,
     },
     "get_passages": {
         "signature": '(topic_id: int, limit?: int)',
@@ -668,6 +1034,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         ),
         "parameters": {"type": "object", "properties": {"topic_ids": {"type": "array", "items": {"type": "integer"}}, "count_per_topic": {"type": "integer"}, "difficulty": {"type": "string"}, "confirmed": {"type": "boolean"}}, "required": []},
         "run": generate_quiz,
+        "args_model": GenerateQuizArgs,
     },
     "generate_study_plan": {
         "signature": '(confirmed?: bool)',
@@ -710,19 +1077,83 @@ TOOLS: dict[str, dict[str, Any]] = {
         ),
         "parameters": {"type": "object", "properties": {"question": {"type": "string"}, "options": {"type": "array", "items": {"type": "string"}}, "allow_free_text": {"type": "boolean"}}, "required": ["question"]},
         "run": ask_clarify,
+        "args_model": AskClarifyArgs,
     },
     "record_understanding": {
-        "signature": '(topic_id: int, demonstrated: float, evidence?: str)',
+        "signature": '(topic_id: int, demonstrated: float, coverage?: float, evidence?: str)',
         "description": (
             "Record understanding the learner demonstrated IN CHAT: a correct "
             "explanation, an accurate paraphrase, a right answer to a check "
-            "question. demonstrated is 0.0-1.0 for how fully correct they "
-            "were; evidence is a short quote of what they got right. "
+            "question. demonstrated is 0.0-1.0 for how correct they were ON "
+            "WHAT WAS TESTED; coverage is 0.0-1.0 for what fraction of the "
+            "WHOLE topic that evidence spans (one subtopic of five ≈ 0.2, a "
+            "single check question ≈ 0.1-0.3, a full-topic explanation ≈ "
+            "0.8-1.0). The score update is scaled by coverage, so partial "
+            "evidence nudges instead of jumping. With an active plan, use the "
+            "finished step's weight as coverage. Estimate coverage every "
+            "call. evidence is a short quote of what they got right. "
             "Background write — no confirmation, never mention scores. Call "
             "it in the same turn you praise/confirm their answer."
         ),
-        "parameters": {"type": "object", "properties": {"topic_id": {"type": "integer"}, "demonstrated": {"type": "number"}, "evidence": {"type": "string"}}, "required": ["topic_id", "demonstrated"]},
+        "parameters": {"type": "object", "properties": {"topic_id": {"type": "integer"}, "demonstrated": {"type": "number"}, "coverage": {"type": "number", "description": "REQUIRED: what fraction of the WHOLE topic was tested (count the topic's subtopics: one of five = 0.2, single check question = 0.1-0.3, full-topic explanation = 0.8-1.0)"}, "evidence": {"type": "string"}}, "required": ["topic_id", "demonstrated", "coverage"]},
         "run": record_understanding,
+        "args_model": RecordUnderstandingArgs,
+    },
+    "ask_review": {
+        "signature": '(items: {topic_id: int, prompt: str, key_points: str[]}[])',
+        "description": (
+            "Run a spaced-repetition recall session — renders INLINE as flip "
+            "cards (prompt → reveal → self-rate Forgot/Shaky/Knew, graded "
+            "straight into SM-2). Build ONE item per due topic from "
+            "get_due_reviews, with prompt + key points grounded in that "
+            "topic's passages (use get_passages first). Capped at the user's "
+            "review batch setting. No "
+            "confirmation needed; never use for new teaching (that's chat) "
+            "or graded quizzes (that's generate_quiz)."
+        ),
+        "parameters": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object"}}}, "required": ["items"]},
+        "run": ask_review,
+        "args_model": AskReviewArgs,
+    },
+    "start_timer": {
+        "signature": '(topic_id: int, label?: str)',
+        "description": (
+            "Start a study timer on a topic — renders as a live pill in the "
+            "tutor header; stopping auto-logs the session (study log + SM-2 "
+            "tick). Call when the learner begins focused study ('let me study "
+            "X', starting a plan item). No confirmation needed."
+        ),
+        "parameters": {"type": "object", "properties": {"topic_id": {"type": "integer"}, "label": {"type": "string"}}, "required": ["topic_id"]},
+        "run": start_timer,
+        "args_model": StartTimerArgs,
+    },
+    "stop_timer": {
+        "signature": '()',
+        "description": (
+            "Stop the active study timer ('I'm done', 'stop the timer'). The "
+            "frontend logs the elapsed session automatically. No confirmation."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+        "run": stop_timer,
+    },
+    "update_todo": {
+        "signature": '(todos: {content: str, status: str, activeForm?: str, weight?: float}[])',
+        "description": (
+            "Standard plan tracker for multi-step work — renders as a progress "
+            "graph in the side panel. Pass the FULL list each call "
+            "(status: pending | in_progress | completed, exactly ONE "
+            "in_progress). content is the step name; activeForm is the "
+            "present-continuous label ('Building quiz'). For topic study, "
+            "open the plan at session start with one step per subtopic and a "
+            "weight per step (share of the whole topic; normalized to sum "
+            "1.0, equal splits if omitted) — then score each finished "
+            "subtopic with record_understanding using coverage = its weight, "
+            "so the topic score is the fair sum of weight × demonstrated. "
+            "No confirmation needed; never paste the list in text."
+        ),
+        "parameters": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object"}}}, "required": ["todos"]},
+        "run": update_todo,
+        "args_model": UpdateTodoArgs,
     },
 }
 
@@ -731,7 +1162,16 @@ def run_tool(db, user_id: int, name: str, args: dict) -> Any:
     spec = TOOLS.get(name)
     if spec is None:
         return {"error": f"unknown tool '{name}'"}
-    return spec["run"](db, user_id, args or {})
+    args = args or {}
+    model = spec.get("args_model")
+    if model is not None:
+        try:
+            # exclude_none: an explicit null must fall back to the function's
+            # own default (int(None) would crash where a missing key works).
+            args = model.model_validate(args).model_dump(exclude_none=True)
+        except Exception as e:  # noqa: BLE001 — ValidationError -> model-readable
+            return {"error": f"invalid args for '{name}': {e}"[:500]}
+    return spec["run"](db, user_id, args)
 
 
 def openai_tools() -> list[dict]:

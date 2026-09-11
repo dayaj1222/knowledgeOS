@@ -31,11 +31,39 @@ from sqlalchemy import func, select
 from .. import models
 from ..ai import chat_stream, chat_with_tools
 from ..services import ReviewService
+from . import cards as card_registry
 from .prompt import QUIZ_DEBRIEF_PROMPT, TUTOR_PROMPT
 from .tutor_tools import openai_tools, run_tool
 
 MAX_TOOL_ROUNDS = 8
 PREVIEW_LEN = 300
+
+
+def _library_line(db, user_id: int) -> str:
+    """Static library structure for the SYSTEM prompt (sent once per
+    conversation): courses with modules and topics, ids only — no scores,
+    no passage counts, nothing dynamic. The model refetches via
+    get_course_tree when the library changes or it needs detail."""
+    from .tutor_tools import course_tree as _course_tree
+
+    courses = db.scalars(
+        select(models.Course).where(models.Course.user_id == user_id)
+    ).all()
+    if not courses:
+        return "LIBRARY STRUCTURE: (no courses yet)"
+    parts = []
+    for c in courses:
+        tree = _course_tree(db, user_id, c.id) or {}
+        mods = []
+        for m in tree.get("modules", []):
+            topics = ", ".join(f"{t['name']} (t{t['id']})" for t in m["topics"])
+            mods.append(f"{m['name']} [m{m['id']}]: {topics or '(no topics)'}")
+        parts.append(f"{c.name} (c{c.id}): " + (" | ".join(mods) or "(no modules)"))
+    line = "LIBRARY STRUCTURE (Course > Module > Topic; quiz/passage/review/timer tools take topic_id): " + " ;; ".join(parts)
+    if len(line) > 1500:
+        short = "; ".join(f"{c.name} (c{c.id})" for c in courses)
+        line = f"LIBRARY STRUCTURE (condensed — call get_course_tree per course for topics): {short}"
+    return line
 
 
 def build_snapshot(db, user_id: int) -> str:
@@ -97,14 +125,90 @@ def _thread_id(user_id: int, conversation_id: int) -> str:
     return f"tutor_u{user_id}_c{conversation_id}"
 
 
-def _stable_system(custom: str) -> str:
+def _persona_block(pref) -> str:
+    """Compose the user's tutor controls into one system-prompt block:
+    teaching style preset + verbosity + free-text instructions. Defaults
+    inject nothing (keep the prompt lean); anything set overrides the
+    built-in TEACH-loop defaults for tone and length."""
+    if pref is None:
+        return ""
+    lines = []
+    style = (pref.tutor_style or "balanced").strip().lower()
+    if style == "socratic":
+        lines.append("Teaching style: Socratic — lead with questions, never lecture; make the student derive each step before you confirm it.")
+    elif style == "direct":
+        lines.append("Teaching style: direct — explain first, crisply and completely, then check with one question.")
+    elif style == "drill":
+        lines.append("Teaching style: exam drill — prioritize practice questions and timed recall over explanation; teach only to fix misses.")
+    verbosity = (pref.tutor_verbosity or "balanced").strip().lower()
+    if verbosity == "concise":
+        lines.append("Reply length: concise — a few sentences max per turn, no preamble, no recap unless asked.")
+    elif verbosity == "detailed":
+        lines.append("Reply length: detailed — full worked examples and thorough explanations when the topic warrants it.")
+    if pref.tutor_instructions and pref.tutor_instructions.strip():
+        lines.append(f"STUDENT'S CUSTOM INSTRUCTIONS (highest priority, follow them):\n{pref.tutor_instructions.strip()}")
+    if not lines:
+        return ""
+    return "\n\nTUTOR PERSONA (user-configured, overrides defaults):\n" + "\n".join(lines)
+
+
+def _stable_system(custom: str, library: str = "") -> str:
     """System prompt that is IDENTICAL every turn of a conversation.
 
     Per-turn state (learner snapshot, UI state) rides on the latest user
     message instead — the proxy only forwards the system block on the
-    first exchange and appends deltas after that.
+    first exchange and appends deltas after that. The static library
+    structure rides here too (one-time cost); dynamic scores/counts stay
+    in the snapshot or behind get_course_tree.
     """
-    return f"{TUTOR_PROMPT}{custom}"
+    base = f"{TUTOR_PROMPT}{custom}"
+    return f"{base}\n\n{library}" if library else base
+
+
+def _todo_line(db, conversation_id: int) -> str:
+    """Per-turn plan state for the prompt (this conversation only).
+
+    The model demonstrably acts on per-turn context (snapshot, UI state) and
+    ignores buried system-prompt lines — so the active plan and the
+    create/maintain instruction ride the user message every turn, keeping
+    update_todo calls and the side-panel graph in sync with the teaching.
+    """
+    last = db.scalar(
+        select(models.Card)
+        .where(
+            models.Card.conversation_id == conversation_id,
+            models.Card.kind == "todo",
+        )
+        .order_by(models.Card.id.desc())
+    )
+    if last is None:
+        return (
+            "\n\nPLAN: none active. If this turn starts multi-step work "
+            "(2+ steps), call update_todo FIRST to open one — never claim a "
+            "plan is tracked without the update_todo tool result in this turn."
+        )
+    try:
+        args = last.payload or {}
+        todos = args.get("todos", [])
+        total = args.get("total", len(todos))
+        done = args.get("completed", sum(1 for t in todos if t.get("status") == "completed"))
+        current = args.get("current_active") or args.get("current") or "?"
+        shares = ", ".join(
+            f"{t.get('content', '?')[:40]} ({round((t.get('weight') or 0) * 100)}%, {t.get('status')})"
+            for t in todos
+        )
+    except (AttributeError, IndexError, TypeError):
+        return ""
+    if done >= total:
+        return f"\n\nPLAN: complete ({done}/{total}). Open a new one with update_todo when fresh multi-step work starts."
+    return (
+        f"\n\nPLAN: {done}/{total} done, current step: '{current}'. "
+        f"Shares: {shares}. "
+        "When the current step completes, score it with record_understanding "
+        "using coverage = its share (weight × demonstrated is the fair topic "
+        "credit), then re-call update_todo with the FULL updated list — "
+        "the side panel graphs exactly what you last wrote."
+    )
 
 
 def _open_turn(db, user_id: int, conversation_id: int | None, message: str,
@@ -148,18 +252,15 @@ def _open_turn(db, user_id: int, conversation_id: int | None, message: str,
     messages: list[dict] = []
     snapshot = build_snapshot(db, user_id)
     pref = db.get(models.Preference, user_id)
-    custom = (
-        f"\n\nSTUDENT'S CUSTOM INSTRUCTIONS (highest priority, follow them):\n{pref.tutor_instructions.strip()}"
-        if pref and pref.tutor_instructions and pref.tutor_instructions.strip()
-        else ""
-    )
-    messages.append({"role": "system", "content": _stable_system(custom)})
+    custom = _persona_block(pref)
+    library = _library_line(db, user_id)
+    messages.append({"role": "system", "content": _stable_system(custom, library)})
     for m in prior[-20:]:
         messages.append({
             "role": m.role,
             "content": m.content,
         })
-    context_line = f"LEARNER SNAPSHOT: {snapshot}{_ui_state_line(ui_context)}"
+    context_line = f"LEARNER SNAPSHOT: {snapshot}{_ui_state_line(ui_context)}{_todo_line(db, conversation_id)}"
     messages.append({
         "role": "user",
         "content": f"{context_line}\n\n{message}",
@@ -175,25 +276,18 @@ def _stamp_clarify_answered(db, conversation_id: int, message: str) -> None:
     (JSON columns need full reassignment for change tracking.)
     """
     open_cards = db.scalars(
-        select(models.ChatMessage)
+        select(models.Card)
         .where(
-            models.ChatMessage.conversation_id == conversation_id,
-            models.ChatMessage.role == "clarify",
+            models.Card.conversation_id == conversation_id,
+            models.Card.kind == "clarify",
         )
-        .order_by(models.ChatMessage.id.desc())
+        .order_by(models.Card.id.desc())
     ).all()
     for card in open_cards:
-        calls = list(card.tool_calls or [])
-        if not calls or not isinstance(calls[0], dict):
-            continue
-        args = dict(calls[0].get("args") or {})
+        args = dict(card.payload or {})
         if args.get("completed"):
             continue
-        calls[0] = {
-            **calls[0],
-            "args": {**args, "completed": True, "answer": message[:500]},
-        }
-        card.tool_calls = calls
+        card.payload = {**args, "completed": True, "answer": message[:500]}
         db.commit()
         break
 
@@ -221,38 +315,13 @@ def _preview(result) -> str:
     return text[:PREVIEW_LEN]
 
 
-def _close_turn(db, conversation_id: int, reply: str, tool_calls: list[dict]) -> None:
-    db.add(
-        models.ChatMessage(
-            conversation_id=conversation_id,
-            role="assistant",
-            content=reply,
-            tool_calls=tool_calls or None,
-        )
-    )
-    db.commit()
-
-
-def _capture_quiz(name: str, result) -> dict | None:
-    """Pull the inline-quiz payload out of a generate_quiz tool result."""
-    if name != "generate_quiz" or not isinstance(result, dict):
-        return None
-    if result.get("type") != "assessment" or not result.get("questions"):
-        return None
-    return {
-        "assessment_id": result.get("assessment_id"),
-        "questions": result.get("questions"),
-    }
-
-
-def _persist_quiz_message(db, conversation_id: int, quiz: dict) -> int:
-    """Persist the inline quiz as a role='quiz' message (payload rides the
-    existing tool_calls JSON column — no migration) and return its id."""
+def _close_turn(db, conversation_id: int, reply: str, tool_calls: list[dict]) -> int:
+    """Persist the assistant reply; returns its id (card display anchor)."""
     msg = models.ChatMessage(
         conversation_id=conversation_id,
-        role="quiz",
-        content="",
-        tool_calls=[{"tool": "quiz", "args": quiz}],
+        role="assistant",
+        content=reply,
+        tool_calls=tool_calls or None,
     )
     db.add(msg)
     db.commit()
@@ -260,40 +329,18 @@ def _persist_quiz_message(db, conversation_id: int, quiz: dict) -> int:
     return msg.id
 
 
-def _capture_clarify(name: str, result) -> dict | None:
-    """Pull the clarify payload out of an ask_clarify tool result."""
-    if name != "ask_clarify" or not isinstance(result, dict):
-        return None
-    if not result.get("question"):
-        return None
-    return {
-        "question": result.get("question", ""),
-        "options": result.get("options", []) or [],
-        "allow_free_text": result.get("allow_free_text", True),
-    }
+def _finalize_turn(
+    db, conversation_id: int, reply: str, tool_calls: list[dict],
+    ui_actions: list[dict], cards: dict[str, dict],
+) -> dict:
+    """Persist the turn (assistant reply + optional inline cards) and build
+    the turn dict shared by the sync and streaming paths.
 
-
-def _persist_clarify_message(db, conversation_id: int, clarify: dict) -> int:
-    """Persist the clarify card as role='clarify' (payload rides the
-    existing tool_calls JSON column — no migration) and return its id."""
-    msg = models.ChatMessage(
-        conversation_id=conversation_id,
-        role="clarify",
-        content="",
-        tool_calls=[{"tool": "clarify", "args": clarify}],
-    )
-    db.add(msg)
-    db.commit()
-    db.refresh(msg)
-    return msg.id
-
-
-def _finalize_turn(db, conversation_id: int, reply: str, tool_calls: list[dict],
-                   ui_actions: list[dict], quiz: dict | None,
-                   clarify: dict | None = None) -> dict:
-    """Persist the turn (assistant reply + optional inline quiz/clarify card) and
-    build the turn dict shared by the sync and streaming paths."""
-    _close_turn(db, conversation_id, reply, tool_calls)
+    cards maps kind -> raw tool payload; first-wins/last-wins already applied
+    by the loops. Turn keys (quiz/clarify/review/timer/todo/video) keep their
+    exact legacy shapes — see cards.slim.
+    """
+    anchor_id = _close_turn(db, conversation_id, reply, tool_calls)
     out: dict = {
         "conversation_id": conversation_id,
         "reply": reply,
@@ -301,15 +348,23 @@ def _finalize_turn(db, conversation_id: int, reply: str, tool_calls: list[dict],
         "ui_actions": ui_actions,
         "quiz": None,
         "clarify": None,
+        "review": None,
+        "timer": None,
+        "todo": None,
+        "video": None,
     }
-    if quiz:
-        # The inline card replaces the old open_quiz navigation this turn.
-        out["ui_actions"] = [a for a in ui_actions if a.get("action") != "open_quiz"]
-        message_id = _persist_quiz_message(db, conversation_id, quiz)
-        out["quiz"] = {"message_id": message_id, **quiz}
-    if clarify:
-        message_id = _persist_clarify_message(db, conversation_id, clarify)
-        out["clarify"] = {"message_id": message_id, **clarify}
+    for kind, raw in cards.items():
+        payload = card_registry.slim(kind, raw)
+        if kind == "timer":
+            out["timer"] = payload
+            continue
+        if kind == "quiz":
+            # The inline card replaces the old open_quiz navigation this turn.
+            out["ui_actions"] = [a for a in ui_actions if a.get("action") != "open_quiz"]
+        card = card_registry.persist_card(
+            db, conversation_id, kind, payload, message_id=anchor_id
+        )
+        out[kind] = {"message_id": card.id, **payload}
     return out
 
 
@@ -375,8 +430,7 @@ def _run_tool_loop(db, user_id: int, conversation_id: int, messages: list[dict],
     tools = openai_tools()
     tool_calls: list[dict] = []
     ui_actions: list[dict] = []
-    quiz: dict | None = None
-    clarify: dict | None = None
+    cards: dict[str, dict] = {}  # kind -> raw payload (registry applies first/last-wins)
     seen: set[str] = set()  # exact-duplicate (tool, args) calls run once per turn
     reply = ""
     for _ in range(MAX_TOOL_ROUNDS):
@@ -416,10 +470,12 @@ def _run_tool_loop(db, user_id: int, conversation_id: int, messages: list[dict],
             seen.add(key)
             result, ui_action = _execute_call(db, user_id, name, args)
             tool_calls.append({"tool": name, "args": args, "result_preview": _preview(result)})
-            if quiz is None:
-                quiz = _capture_quiz(name, result)
-            if clarify is None:
-                clarify = _capture_clarify(name, result)
+            hit = card_registry.capture(name, result)
+            if hit is not None:
+                kind, payload = hit
+                _, first_wins = card_registry.TRIGGERS[name]
+                if not first_wins or kind not in cards:
+                    cards[kind] = payload
             if ui_action is not None:
                 ui_actions.append(ui_action)
             messages.append(
@@ -432,7 +488,7 @@ def _run_tool_loop(db, user_id: int, conversation_id: int, messages: list[dict],
     else:
         reply = reply or "Let me know how you'd like to proceed."
 
-    return _finalize_turn(db, conversation_id, reply, tool_calls, ui_actions, quiz, clarify)
+    return _finalize_turn(db, conversation_id, reply, tool_calls, ui_actions, cards)
 
 
 def run_quiz_debrief(db, user_id: int, conversation_id: int, assessment_id: int) -> dict:
@@ -487,18 +543,15 @@ def run_quiz_debrief(db, user_id: int, conversation_id: int, assessment_id: int)
     # Stamp the inline quiz card completed so reloads render a read-only
     # state (no typing UI) — review lives in the Quiz tab, not the chat.
     # (JSON columns need full reassignment for change tracking.)
-    for qm in db.scalars(
-        select(models.ChatMessage).where(
-            models.ChatMessage.conversation_id == conversation_id,
-            models.ChatMessage.role == "quiz",
+    for card in db.scalars(
+        select(models.Card).where(
+            models.Card.conversation_id == conversation_id,
+            models.Card.kind == "quiz",
         )
     ).all():
-        calls = list(qm.tool_calls or [])
-        if calls and isinstance(calls[0], dict):
-            args = dict(calls[0].get("args") or {})
-            if args.get("assessment_id") == assessment_id:
-                calls[0] = {**calls[0], "args": {**args, "completed": True}}
-                qm.tool_calls = calls
+        args = dict(card.payload or {})
+        if args.get("assessment_id") == assessment_id:
+            card.payload = {**args, "completed": True}
     db.commit()
 
     history = db.scalars(
@@ -509,14 +562,15 @@ def run_quiz_debrief(db, user_id: int, conversation_id: int, assessment_id: int)
     ).all()
     prior = [m for m in reversed(history) if m.role in ("user", "assistant")]
     snapshot = build_snapshot(db, user_id)
+    library = _library_line(db, user_id)
     thread_id = _thread_id(user_id, conversation_id)
     messages = [
-        {"role": "system", "content": f"{TUTOR_PROMPT}\n\n{QUIZ_DEBRIEF_PROMPT}"},
+        {"role": "system", "content": f"{TUTOR_PROMPT}\n\n{QUIZ_DEBRIEF_PROMPT}\n\n{library}"},
     ]
     for m in prior[-20:]:
         messages.append({"role": m.role, "content": m.content})
     messages.append({"role": "user", "content": (
-        f"LEARNER SNAPSHOT: {snapshot}\n\n"
+        f"LEARNER SNAPSHOT: {snapshot}{_todo_line(db, conversation_id)}\n\n"
         "=== HIDDEN QUIZ RESULTS (the student cannot see this — "
         "never quote scores, feedback, or rubrics) ===\n"
         f"{summary}\n\nWrite your debrief recommendation now."
@@ -535,8 +589,7 @@ async def stream_tutor_turn(db, user_id: int, conversation_id: int | None, messa
     tools = openai_tools()
     tool_calls: list[dict] = []
     ui_actions: list[dict] = []
-    quiz: dict | None = None
-    clarify: dict | None = None
+    cards: dict[str, dict] = {}  # kind -> raw payload (registry applies first/last-wins)
     seen: set[str] = set()  # exact-duplicate (tool, args) calls run once per turn
     reply = ""
     for _ in range(MAX_TOOL_ROUNDS):
@@ -576,10 +629,12 @@ async def stream_tutor_turn(db, user_id: int, conversation_id: int | None, messa
             preview = _preview(result)
             tool_calls.append({"tool": name, "args": args, "result_preview": preview})
             yield {"type": "tool", "tool": name, "args": args, "result_preview": preview}
-            if quiz is None:
-                quiz = _capture_quiz(name, result)
-            if clarify is None:
-                clarify = _capture_clarify(name, result)
+            hit = card_registry.capture(name, result)
+            if hit is not None:
+                kind, payload = hit
+                _, first_wins = card_registry.TRIGGERS[name]
+                if not first_wins or kind not in cards:
+                    cards[kind] = payload
             if ui_action is not None:
                 ui_actions.append(ui_action)
             messages.append(
@@ -592,4 +647,4 @@ async def stream_tutor_turn(db, user_id: int, conversation_id: int | None, messa
     else:
         reply = reply or "Let me know how you'd like to proceed."
 
-    yield {"type": "done", **_finalize_turn(db, conversation_id, reply, tool_calls, ui_actions, quiz, clarify)}
+    yield {"type": "done", **_finalize_turn(db, conversation_id, reply, tool_calls, ui_actions, cards)}

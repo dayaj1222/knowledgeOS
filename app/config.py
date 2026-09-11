@@ -55,10 +55,27 @@ class IngestConfig:
 
 
 @dataclass(frozen=True)
+class ProficiencyConfig:
+    quiz_alpha: float = field(default_factory=lambda: float(_get("proficiency", "quiz_alpha", 0.3)))
+    chat_alpha: float = field(default_factory=lambda: float(_get("proficiency", "chat_alpha", 0.2)))
+    study_alpha: float = field(default_factory=lambda: float(_get("proficiency", "study_alpha", 0.15)))
+
+
+@dataclass(frozen=True)
+class SchedulerConfig:
+    w_prof: float = field(default_factory=lambda: float(_get("scheduler", "w_prof", 0.5)))
+    w_prio: float = field(default_factory=lambda: float(_get("scheduler", "w_prio", 0.25)))
+    w_dead: float = field(default_factory=lambda: float(_get("scheduler", "w_dead", 0.25)))
+    deadline_cap: float = field(default_factory=lambda: float(_get("scheduler", "deadline_cap", 7.0)))
+
+
+@dataclass(frozen=True)
 class Settings:
     llm: LLMConfig = field(default_factory=LLMConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     ingest: IngestConfig = field(default_factory=IngestConfig)
+    proficiency: ProficiencyConfig = field(default_factory=ProficiencyConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
 
 settings = Settings()

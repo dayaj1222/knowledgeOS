@@ -35,3 +35,7 @@ dist-ssr/
 Thumbs.db
 .vscode/
 .idea/
+
+# SQLite sidecar files
+*.db-shm
+*.db-wal

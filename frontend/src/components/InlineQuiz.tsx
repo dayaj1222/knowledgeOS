@@ -10,6 +10,7 @@ import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, Brain, Check, Clock3, Loader2 } from "lucide-react";
 import {
   USER_ID,
+  cardPayload,
   createAttempt,
   gradeAttempt,
   type ChatMessage,
@@ -44,7 +45,7 @@ export default function InlineQuiz({
   conversationId: number;
   onFinish: (conversationId: number, assessmentId: number) => Promise<void>;
 }) {
-  const args = (message.tool_calls?.[0]?.args ?? {}) as {
+  const args = (cardPayload(message)) as {
     assessment_id?: number;
     questions?: QuizQuestion[];
     completed?: boolean;
@@ -52,7 +53,7 @@ export default function InlineQuiz({
   const assessmentId = args.assessment_id ?? 0;
   const questions = args.questions ?? [];
   // Server-stamped on debrief: a finished quiz is read-only (no typing UI).
-  // Review lives in the Quiz tab; the tutor's note is the thread reply below.
+  // The tutor's note is the thread reply below.
   const [done, setDone] = useState(args.completed === true);
 
   const [draft, setDraft] = useState<QuizDraft>(

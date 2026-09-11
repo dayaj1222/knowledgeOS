@@ -1,10 +1,8 @@
 import { NavLink } from "react-router-dom";
 import { useState } from "react";
 import {
-  LayoutDashboard,
   BookOpen,
   CalendarDays,
-  Brain,
   Settings,
   GraduationCap,
   Bot,
@@ -15,11 +13,9 @@ import { USER_ID } from "../api";
 import ThemeToggle from "./ThemeToggle";
 
 const items = [
-  { to: "/", label: "Overview", icon: LayoutDashboard },
-  { to: "/tutor", label: "Tutor", icon: Bot },
+  { to: "/", label: "Tutor", icon: Bot },
   { to: "/library", label: "Library & Docs", icon: BookOpen },
   { to: "/plan", label: "Study Schedule", icon: CalendarDays },
-  { to: "/quiz", label: "Adaptive Quiz", icon: Brain },
   { to: "/settings", label: "Preferences", icon: Settings },
 ];
 

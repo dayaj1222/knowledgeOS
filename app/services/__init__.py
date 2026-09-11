@@ -10,10 +10,17 @@ Contains reusable, modular, and testable service logic separated from HTTP route
 """
 
 from .course_service import CourseService
-from .schedule_service import ScheduleService
+from .proficiency_service import (
+    CHAT_UNDERSTANDING,
+    MANUAL_OVERRIDE,
+    QUIZ_ATTEMPT,
+    STUDY_LOG,
+    ProficiencyService,
+)
 from .quiz_service import QuizService
+from .review_service import ReviewService, score_to_quality, sm2_step
+from .schedule_service import ScheduleService
 from .study_service import StudyService
-from .review_service import ReviewService, sm2_step, score_to_quality
 
 __all__ = [
     "CourseService",
@@ -21,6 +28,11 @@ __all__ = [
     "QuizService",
     "StudyService",
     "ReviewService",
+    "ProficiencyService",
+    "QUIZ_ATTEMPT",
+    "CHAT_UNDERSTANDING",
+    "STUDY_LOG",
+    "MANUAL_OVERRIDE",
     "sm2_step",
     "score_to_quality",
 ]

@@ -59,7 +59,7 @@ close_port 5173
 
 echo "Starting backend on http://localhost:8000 ..."
 cd "$ROOT"
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+uv run uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 &
 BACKEND_PID=$!
 
 echo "Starting frontend on http://localhost:5173 ..."

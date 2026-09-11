@@ -6,6 +6,7 @@
 import { useState } from "react";
 import { Check, HelpCircle, Send } from "lucide-react";
 import type { ChatMessage } from "../api";
+import { cardPayload } from "../api";
 
 interface ClarifyArgs {
   question?: string;
@@ -24,7 +25,7 @@ export default function InlineClarify({
   onAnswer: (answer: string) => void;
   busy: boolean;
 }) {
-  const args = (message.tool_calls?.[0]?.args ?? {}) as ClarifyArgs;
+  const args = (cardPayload(message)) as ClarifyArgs;
   const question = args.question ?? "";
   const options = args.options ?? [];
   const allowFreeText = args.allow_free_text !== false;

@@ -1,0 +1,15 @@
+{
+  "_note": "Golden set for the deterministic tagger. Each case: chunk text and the expected primary topic id (null = must stay untagged). Threshold for the suite: precision >= 0.8.",
+  "topics": [
+    {"id": 1, "name": "Shared Resources", "description": "Mutual exclusion for shared resources; critical sections must be protected."},
+    {"id": 2, "name": "Priority Inversion", "description": "A low priority task blocks a high priority task by holding a resource."},
+    {"id": 3, "name": "Deadlocks", "description": "Circular wait: mutual exclusion, hold and wait, no preemption."}
+  ],
+  "cases": [
+    {"id": 1, "section_path": "Priority Inversion", "content": "When a low priority task holds a lock the high task needs, priority inheritance fixes the wait.", "expected": 2},
+    {"id": 2, "section_path": "Deadlocks", "content": "Circular waiting needs mutual exclusion plus hold-and-wait plus no preemption together.", "expected": 3},
+    {"id": 3, "section_path": "", "content": "Module 3 Dept of CSE Page 12", "expected": null},
+    {"id": 4, "section_path": "Shared Resources", "content": "Enter a critical section only after acquiring the lock protecting the shared resource.", "expected": 1},
+    {"id": 5, "section_path": "Priority Inversion", "content": "Deadlock can also arise when two tasks hold resources in opposite order.", "expected": 2}
+  ]
+}

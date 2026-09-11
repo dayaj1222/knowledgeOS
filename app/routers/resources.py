@@ -9,19 +9,19 @@ Uses the standard response envelope (app.protocol) and ASYNC extraction:
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
-import threading
-
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..agent import parse_syllabus, tag_passages_to_topics
+from ..agent import parse_syllabus
 from ..database import SessionLocal, get_db
-from ..ingest import extract_text, chunk_text, save_upload
-from ..protocol import ok, fail, TERMINAL_STATUSES
+from ..ingest import chunk_text, extract_text, save_upload
+from ..ingest.tagger import assign_passages
+from ..protocol import TERMINAL_STATUSES, fail, ok
 
 router = APIRouter(prefix="/api", tags=["resources"])
 
@@ -134,6 +134,7 @@ def _extract_locked(resource_id: int) -> None:
                 resource_id=resource_id,
                 content=c["content"],
                 index_order=c["index_order"],
+                section_path=c.get("section_path"),
                 page_start=c.get("page_start"),
                 page_end=c.get("page_end"),
             ))
@@ -151,7 +152,9 @@ def _extract_locked(resource_id: int) -> None:
 
 
 def _tag_passages(res: models.Resource, db: Session) -> None:
-    """LLM-assign each passage to one topic in the resource's module."""
+    """Deterministically assign each passage to one topic in the resource's
+    module (name+description term scoring, no LLM). Unmatched passages keep
+    topic_id NULL — visible as untagged, never force-filed."""
     topics = db.scalars(
         select(models.Topic).where(models.Topic.module_id == res.module_id)
     ).all()
@@ -164,22 +167,23 @@ def _tag_passages(res: models.Resource, db: Session) -> None:
         .order_by(models.Passage.index_order)
     ).all()
 
-    topic_map = [{"id": t.id, "name": t.name} for t in topics]
-    passage_map = [{"id": p.id, "content": p.content} for p in passages]
-
-    try:
-        topic_to_passages = tag_passages_to_topics(passage_map, topic_map)
-    except Exception as e:  # noqa: BLE001 — LLM may fail; leave passages untagged
-        res.error = f"tagging_error: {e}"
-        return
-
-    # topic_to_passages is {topic_id: [passage_id, ...]}; write back topic_id.
+    assigned = assign_passages(
+        [
+            {"id": p.id, "content": p.content, "section_path": p.section_path or ""}
+            for p in passages
+        ],
+        [
+            {"id": t.id, "name": t.name, "description": t.description or ""}
+            for t in topics
+        ],
+    )
     by_id = {p.id: p for p in passages}
-    for topic_id, passage_ids in topic_to_passages.items():
-        for pid in passage_ids:
-            p = by_id.get(int(pid))
-            if p is not None:
-                p.topic_id = int(topic_id)
+    for pid, result in assigned.items():
+        p = by_id.get(int(pid))
+        if p is not None:
+            p.topic_id = result["primary"]
+            p.tag_confidence = result["confidence"]
+            p.extra_topic_ids = result["extras"]
 
 
 @router.post("/courses/{course_id}/resources", status_code=202)
@@ -207,6 +211,11 @@ async def upload_resource(
 
     data = await file.read()
     filename = name or file.filename or "upload"
+    # Extensionless custom names break type detection downstream (extractors
+    # key off suffix) — inherit the uploaded file's suffix when missing.
+    orig_suffix = Path(file.filename or "").suffix
+    if orig_suffix and not Path(filename).suffix:
+        filename = filename + orig_suffix
 
     # Duplicate guard: same course + same filename (case-insensitive) means
     # this file was already uploaded — reject instead of extracting twice.
@@ -322,6 +331,7 @@ def list_passages(resource_id: int, db: Session = Depends(get_db)):
             "id": p.id,
             "content": p.content,
             "index_order": p.index_order,
+            "section_path": p.section_path,
             "page_start": p.page_start,
             "page_end": p.page_end,
             "topic_id": p.topic_id,

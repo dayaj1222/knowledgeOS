@@ -1,12 +1,17 @@
-"""Extract text from uploaded files via a cheap-first detection ladder.
+"""Extract text from uploaded files, markitdown-first.
 
-Detection order (cheapest first), per the Feature 2 design:
-1. pdftotext PER-PAGE for PDFs — gives accurate page provenance (a naive
-   whole-doc pdftotext emits \f at column/slide breaks, not page ends, so page
-   numbers derived from it are wrong).
-2. tesseract OCR for PDFs with no text layer (printed text; fails handwriting)
-3. marker-pdf for handwriting/equations (heavy, ~5GB install; opt-in only)
-4. markitdown for pptx/docx (preserves structure)
+Primary: markitdown for every type (pdf/pptx/docx) — it preserves document
+structure as markdown (headings, lists, tables), which the structured
+chunker cuts along. Page numbers are NOT available from markitdown, so
+page_start/page_end are omitted rather than fabricated.
+
+Fallback ladder when markitdown yields nothing:
+1. pdftotext PER-PAGE for PDFs — restores page provenance for the fallback.
+2. tesseract OCR for scanned PDFs (page provenance lost → single page).
+3. marker-pdf for handwriting/equations (heavy, opt-in, may be absent).
+
+Embedded figures (diagrams, scanned figures) are OCRed per page and appended
+as typed <image-text> blocks — OCR only ever describes images, never prose.
 
 Every tool runs as a subprocess; if a tool is missing, degrade rather than crash.
 """
@@ -113,27 +118,6 @@ def _ocr_embedded_images(path: Path, page: int) -> list[str]:
     return texts
 
 
-def _with_image_text(pages: list[tuple[int, str]], path: Path) -> list[tuple[int, str]]:
-    """Append `<image-text>` markers to pages that carry embedded images.
-
-    The marker tells downstream readers (chunker → LLM) that the text came
-    from an image via OCR, so it is graded as diagram/figure content rather
-    than body prose. Pages without images pass through untouched.
-    """
-    out: list[tuple[int, str]] = []
-    for page_num, page_text in pages:
-        images = _ocr_embedded_images(path, page_num)
-        if not images:
-            out.append((page_num, page_text))
-            continue
-        markers = "\n\n".join(
-            f'<image-text page="{page_num}" image="{i}">\n{text}\n</image-text>'
-            for i, text in enumerate(images, 1)
-        )
-        out.append((page_num, page_text + "\n\n" + markers))
-    return out
-
-
 def _markitdown(path: Path) -> str:
     if not _have("markitdown"):
         return ""
@@ -143,34 +127,73 @@ def _markitdown(path: Path) -> str:
     return r.stdout
 
 
+def _figure_blocks(path: Path) -> list[str]:
+    """OCR embedded figures page by page (pdfs only) as typed blocks.
+
+    Needs only pdfinfo (page count) + pdfimages/tesseract — no text layer.
+    Returns [] when tools are missing or no figure text is found.
+    """
+    if path.suffix.lower() != ".pdf":
+        return []
+    pages = _pdfinfo_pages(path)
+    if pages <= 0:
+        return []
+    out: list[str] = []
+    for page in range(1, pages + 1):
+        for i, text in enumerate(_ocr_embedded_images(path, page), 1):
+            out.append(
+                f'<image-text page="{page}" image="{i}">\n{text}\n</image-text>'
+            )
+    return out
+
+
+def _markitdown_quality(text: str) -> bool:
+    """Gate markitdown output: reject heading-less, table-mangled text.
+
+    Failure signature seen live: zero '#' headings plus a high fraction of
+    table rows (positioned prose misread as tables, words scattered across
+    cells). Such output is worse than plain text — fall back to pdftotext,
+    which preserves reading order for text-heavy PDFs.
+    """
+    lines = [line for line in text.split("\n") if line.strip()]
+    if not lines:
+        return False
+    headings = sum(1 for line in lines if line.lstrip().startswith("#"))
+    table_rows = sum(1 for line in lines if line.strip().startswith("|"))
+    if headings == 0 and table_rows / len(lines) > 0.3:
+        return False
+    return True
+
+
 def extract_text(path: Path, file_type: str) -> tuple[str, str, list[tuple[int, str]]]:
     """Return (text, status, pages).
 
-    text = concatenated text; status ∈ {ok, empty, failed};
-    pages = [(page_number, page_text), ...] when the source has page info,
-    else [] (and page provenance is silently absent).
+    text = markdown (primary) or fallback plain text; status ∈ {ok, empty,
+    failed}; pages = [(page_number, page_text), ...] ONLY when the pdftotext
+    fallback produced them — markitdown output carries no page info, and page
+    provenance is omitted rather than fabricated.
     """
-    ext = path.suffix.lower()
-    if ext in (".pptx", ".docx") or file_type in ("pptx", "docx"):
-        text = _markitdown(path)
-        if text.strip():
-            return text, "ok", []
-        return text, "empty" if text is not None else "failed", []
+    text = _markitdown(path)
+    if text.strip() and _markitdown_quality(text):
+        figures = _figure_blocks(path)
+        if figures:
+            text = text + "\n\n" + "\n\n".join(figures)
+        return text, "ok", []
 
-    # PDFs (and slides/notes which are pdfs)
-    pages = _pdftotext_per_page(path)
-    text = "\n\n".join(t for _, t in pages)
-    if text.strip() and len(pages) > 0:
-        # Hybrid PDFs: body text + diagrams/figures as images. OCR the
-        # embedded images so image-only content isn't silently dropped.
-        pages = _with_image_text(pages, path)
+    # Type comes from suffix OR the declared upload type (custom names often
+    # carry no extension — never let a missing suffix skip the PDF ladder).
+    is_pdf = path.suffix.lower() == ".pdf" or (file_type or "").lower() == "pdf"
+    if is_pdf:
+        # Fallback restores page provenance when markitdown finds nothing.
+        pages = _pdftotext_per_page(path)
         text = "\n\n".join(t for _, t in pages)
-        return text, "ok", pages
+        if text.strip() and len(pages) > 0:
+            return text, "ok", pages
 
-    # No usable text layer — try OCR (page provenance lost → single page)
-    ocr = _ocr_pdf(path)
-    if ocr.strip():
-        return ocr, "ok", [(1, ocr)]
+        # No usable text layer — try OCR (page provenance lost → single page)
+        ocr = _ocr_pdf(path)
+        if ocr.strip():
+            return ocr, "ok", [(1, ocr)]
 
     # Last resort: marker-pdf (handwriting/equations) — opt-in, may be absent
     if _have("marker_single"):

@@ -156,7 +156,28 @@ export interface Preference {
   preferred_start?: string | null;
   preferred_end?: string | null;
   tutor_instructions?: string | null;
+  tutor_style: string;
+  tutor_verbosity: string;
+  default_quiz_count: number;
+  default_difficulty: string;
+  review_batch_size: number;
 }
+
+export interface EngineStatus {
+  model: string;
+  endpoint: string;
+  threading: string;
+  database: string;
+  courses: number;
+  topics: number;
+  conversations: number;
+}
+
+export const getEngineStatus = () =>
+  request<EngineStatus>(`/status`);
+
+export const clearConversations = (userId = USER_ID) =>
+  request<{ deleted: number }>(`/users/${userId}/conversations`, { method: "DELETE" });
 
 export interface StudyLog {
   id: number;
@@ -167,7 +188,11 @@ export interface StudyLog {
   plan_id?: number | null;
   minutes_spent: number;
   confidence_after?: number | null;
+  created_at?: string | null;
 }
+
+export const getStudyLogs = (userId = USER_ID) =>
+  request<StudyLog[]>(`/users/${userId}/study-logs`);
 
 // ---- Courses ----
 export const getCourses = (userId = USER_ID) =>
@@ -389,6 +414,10 @@ export interface ChatTurn {
   ui_actions: UiAction[];
   quiz?: InlineQuizPayload | null;
   clarify?: InlineClarifyPayload | null;
+  review?: InlineReviewPayload | null;
+  timer?: TimerPayload | null;
+  todo?: TodoPayload | null;
+  video?: VideoPayload | null;
 }
 
 export interface QuizQuestion {
@@ -414,6 +443,58 @@ export interface InlineClarifyPayload {
   answer?: string | null;
 }
 
+export interface ReviewItem {
+  topic_id: number;
+  topic_name: string;
+  prompt: string;
+  key_points: string[];
+}
+
+export interface InlineReviewPayload {
+  message_id: number;
+  items: ReviewItem[];
+}
+
+export interface TimerPayload {
+  action: "start" | "stop";
+  topic_id?: number;
+  topic_name?: string;
+  label?: string;
+}
+
+export interface VideoItem {
+  video_id: string;
+  title: string;
+  url: string;
+  embed_url: string;
+  thumbnail: string;
+  snippet?: string;
+  relevance?: number;
+  verified?: boolean;
+  verify_note?: string;
+}
+
+export interface VideoPayload {
+  message_id: number;
+  videos: VideoItem[];
+}
+
+export interface TodoItem {
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+  activeForm?: string;
+  weight?: number;
+}
+
+export interface TodoPayload {
+  message_id: number;
+  todos: TodoItem[];
+  total: number;
+  completed: number;
+  current?: string | null;
+  current_active?: string | null;
+}
+
 export interface Conversation {
   id: number;
   title: string;
@@ -424,7 +505,23 @@ export interface ChatMessage {
   role: string;
   content: string;
   tool_calls?: ToolCall[] | null;
+  // Inline cards (backend `cards` table). Legacy cached threads may still
+  // carry card payloads in tool_calls[0].args — components read both.
+  card?: { kind: string; payload: Record<string, unknown> } | null;
   created_at?: string | null;
+}
+
+export function cardPayload(message: ChatMessage): Record<string, unknown> {
+  return (message.card?.payload
+    ?? (message.tool_calls?.[0]?.args as Record<string, unknown> | undefined)
+    ?? {}) as Record<string, unknown>;
+}
+
+export function cardKind(message: ChatMessage): string | null {
+  if (message.role === "card" && message.card) return message.card.kind;
+  // Legacy shapes (localStorage caches from before the cards table).
+  if (["quiz", "clarify", "review", "video", "todo"].includes(message.role)) return message.role;
+  return null;
 }
 
 export interface UiContext {
@@ -502,6 +599,10 @@ export async function sendChatStream(
           ui_actions: (data.ui_actions as UiAction[]) ?? [],
           quiz: (data.quiz as InlineQuizPayload | null) ?? null,
           clarify: (data.clarify as InlineClarifyPayload | null) ?? null,
+          review: (data.review as InlineReviewPayload | null) ?? null,
+          timer: (data.timer as TimerPayload | null) ?? null,
+          todo: (data.todo as TodoPayload | null) ?? null,
+          video: (data.video as VideoPayload | null) ?? null,
         };
       } else if (event === "error") {
         throw new Error(String(data.error ?? "stream error"));

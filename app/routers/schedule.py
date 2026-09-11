@@ -11,9 +11,9 @@ from sqlalchemy.orm import Session
 from .. import models, schemas
 from ..database import get_db
 from ..protocol import ok
+from ..services.review_service import ReviewService
 from ..services.schedule_service import ScheduleService
 from ..services.study_service import StudyService
-from ..services.review_service import ReviewService
 
 router = APIRouter(prefix="/api", tags=["schedule"])
 
@@ -129,6 +129,25 @@ def generate_plan(user_id: int, db: Session = Depends(get_db)):
     return ok([_dump(schemas.PlanOut, p) for p in plans])
 
 
+@router.get("/users/{user_id}/plan-reasons")
+def plan_reasons(user_id: int, db: Session = Depends(get_db)):
+    """Why-plan: scored topics with human-readable reasons (no writes)."""
+    from datetime import datetime
+
+    if not db.get(models.User, user_id):
+        raise HTTPException(404, "User not found")
+    return ok([
+        {
+            "topic_id": s.topic.id,
+            "topic_name": s.topic.name,
+            "need": s.need,
+            "reasons": s.reasons,
+            "components": s.components,
+        }
+        for s in ScheduleService.score_topics(db, user_id, datetime.now())
+    ])
+
+
 @router.patch("/plans/{plan_id}")
 def update_plan(plan_id: int, payload: schemas.PlanUpdate, db: Session = Depends(get_db)):
     """Mark a plan done/skipped (or reopen to pending)."""
@@ -150,7 +169,7 @@ def create_study_log(payload: schemas.StudyLogCreate, db: Session = Depends(get_
 def list_study_logs(user_id: int, db: Session = Depends(get_db)):
     if not db.get(models.User, user_id):
         raise HTTPException(404, "User not found")
-    return ok([_dump(schemas.StudyLogOut, l) for l in StudyService.list_logs(db, user_id)])
+    return ok([_dump(schemas.StudyLogOut, log) for log in StudyService.list_logs(db, user_id)])
 
 
 # ---- Spaced repetition ----
@@ -174,6 +193,7 @@ def submit_review_result(payload: schemas.ReviewResultCreate, db: Session = Depe
         user_id=payload.user_id,
         topic_id=payload.topic_id,
         quality=payload.quality,
+        source="review",
     )
     db.commit()
     db.refresh(review)
