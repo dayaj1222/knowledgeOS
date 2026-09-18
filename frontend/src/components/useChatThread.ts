@@ -1,13 +1,12 @@
-// Shared tutor thread: SSE streaming send, tool visibility, and
-// localStorage caching (messages per conversation + conversation list) so
-// switching threads/tabs never flashes empty while revalidating.
+// Shared tutor thread on React Query: the thread and conversation list are
+// server state (localStorage seeds instant first paint + persists offline).
+// Ephemeral UI (busy, stream text, live tools, timer pill) stays in useState.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   createStudyLog,
-  getChatMessages,
-  getConversations,
   sendChatStream,
   submitChatQuiz,
   type ChatMessage,
@@ -18,11 +17,16 @@ import {
   type UiContext,
 } from "../api";
 import { useStore, useSelectedCourse } from "../store";
+import {
+  LS_CONVOS,
+  LS_MSGS,
+  useConversations,
+  useThreadMessages,
+  writeLS,
+} from "../hooks/queries";
 import { notifyError } from "./notifications";
 import { runUiActions } from "./chatUi";
 
-const LS_CONVOS = "kb.convos";
-const LS_MSGS = (id: number) => `kb.chat.${id}`;
 const LS_TIMER = "kb.timer";
 
 export interface ActiveTimer {
@@ -32,20 +36,12 @@ export interface ActiveTimer {
   startedAt: number;
 }
 
-function readCache<T>(key: string): T | null {
+function readTimer(): ActiveTimer | null {
   try {
-    const raw = localStorage.getItem(key);
-    return raw ? (JSON.parse(raw) as T) : null;
+    const raw = localStorage.getItem(LS_TIMER);
+    return raw ? (JSON.parse(raw) as ActiveTimer) : null;
   } catch {
     return null;
-  }
-}
-
-function writeCache(key: string, value: unknown) {
-  try {
-    localStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    // Quota or private mode — caching is best-effort.
   }
 }
 
@@ -84,6 +80,7 @@ function makeCard(id: number, kind: string, payload: unknown): ChatMessage {
 export function useChatThread() {
   const navigate = useNavigate();
   const location = useLocation();
+  const queryClient = useQueryClient();
   const {
     selectCourse,
     reloadCourses,
@@ -94,24 +91,40 @@ export function useChatThread() {
   } = useStore();
   const selectedCourse = useSelectedCourse();
 
-  // Conversation list: cache first, revalidate in background.
-  const [conversations, setConversations] = useState<Conversation[]>(
-    () => readCache<Conversation[]>(LS_CONVOS) ?? []
+  const convosQuery = useConversations();
+  const threadQuery = useThreadMessages(activeConversationId);
+  const conversations = useMemo(() => convosQuery.data ?? [], [convosQuery.data]);
+  // Pin for the NEXT new conversation (new-chat menu / Library entry).
+  // Stamped server-side on the first message; cleared once created.
+  const [pendingPin, setPendingPin] = useState<{ id: number; name: string } | null>(null);
+  // Library entry: navigation state carries the module to pin.
+  const navPin = (location.state as { pinModule?: { id: number; name: string } } | null)?.pinModule;
+  useEffect(() => {
+    if (navPin != null) {
+      setPendingPin(navPin);
+      setActiveConversationId(null);
+      setSeed([]);
+      navigate(location.pathname, { replace: true, state: null });
+    }
+  }, [navPin]);
+  // New conversation (no id yet): optimistic seed shown until the server
+  // answers with the real thread. Cleared on turn completion or switch.
+  const [seed, setSeed] = useState<ChatMessage[]>([]);
+  const messages = useMemo(
+    () => (activeConversationId == null ? seed : (threadQuery.data ?? [])),
+    [activeConversationId, seed, threadQuery.data]
   );
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  // Todo derives from the latest todo card — no separate state to sync.
+  const todo = useMemo(() => extractTodo(messages), [messages]);
+
   const [busy, setBusy] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [liveTools, setLiveTools] = useState<ToolCall[]>([]);
   // Study timer: tutor-started via start_timer, renders as a live pill.
   // Persisted so a reload keeps counting from the original start.
-  const [timer, setTimer] = useState<ActiveTimer | null>(
-    () => readCache<ActiveTimer>(LS_TIMER)
-  );
-  // Agent todo list: latest update_todo payload (side-panel graph).
-  // Derived from turn.todo on send + last todo card on load.
-  const [todo, setTodo] = useState<TodoPayload | null>(null);
+  const [timer, setTimer] = useState<ActiveTimer | null>(readTimer);
   // Ref mirror — the send() callback reads the live timer without going stale.
-  const timerRef = useRef<ActiveTimer | null>(readCache<ActiveTimer>(LS_TIMER));
+  const timerRef = useRef<ActiveTimer | null>(readTimer());
 
   const persistTimer = useCallback((t: ActiveTimer | null) => {
     timerRef.current = t;
@@ -124,82 +137,93 @@ export function useChatThread() {
     }
   }, []);
 
+  // Append/rewrite helper: React Query cache is the source of truth,
+  // localStorage mirrors it for instant reloads.
+  const updateThread = useCallback(
+    (conversationId: number, updater: (prev: ChatMessage[]) => ChatMessage[]) => {
+      const next = queryClient.setQueryData<ChatMessage[]>(
+        ["thread", conversationId],
+        (prev) => updater(prev ?? [])
+      ) as ChatMessage[] | undefined;
+      if (next) writeLS(LS_MSGS(conversationId), next);
+    },
+    [queryClient]
+  );
+
   const refreshList = useCallback(async () => {
     try {
-      const list = await getConversations();
-      setConversations(list);
-      writeCache(LS_CONVOS, list);
+      const list = await convosQuery.refetch();
+      if (list.data) writeLS(LS_CONVOS, list.data);
     } catch (e) {
       notifyError((e as Error).message);
     }
-  }, []);
+  }, [convosQuery]);
 
   useEffect(() => {
-    refreshList();
-  }, [refreshList]);
-
-  // Active thread: show cache instantly, then revalidate.
-  useEffect(() => {
-    if (activeConversationId == null) {
-      setMessages([]);
-      setTodo(null);
-      return;
-    }
-    const cached = readCache<ChatMessage[]>(LS_MSGS(activeConversationId));
-    if (cached) {
-      setMessages(cached);
-      setTodo(extractTodo(cached));
-    } else {
-      setMessages([]);
-      setTodo(null);
-    }
-    getChatMessages(activeConversationId)
-      .then((fresh) => {
-        setMessages(fresh);
-        setTodo(extractTodo(fresh));
-        writeCache(LS_MSGS(activeConversationId), fresh);
-      })
-      .catch((e) => notifyError((e as Error).message));
+    setSeed([]);
   }, [activeConversationId]);
 
+  useEffect(() => {
+    if (convosQuery.error) notifyError((convosQuery.error as Error).message);
+  }, [convosQuery.error]);
+
+  useEffect(() => {
+    if (threadQuery.error && activeConversationId != null) {
+      notifyError((threadQuery.error as Error).message);
+    }
+  }, [threadQuery.error, activeConversationId]);
+
   const send = useCallback(
-    async (text: string) => {
+    async (text: string, image?: string | null) => {
       const msg = text.trim();
-      if (!msg || busy) return;
+      if ((!msg && !image) || busy) return;
       setBusy(true);
       setStreamText("");
       setLiveTools([]);
       // UI STATE for the tutor: where the student is right now.
+      // Stored pin wins on existing threads (server is source of truth);
+      // pendingPin stamps brand-new conversations on their first message.
+      const activeConvo = conversations.find((c) => c.id === activeConversationId);
       const uiContext: UiContext = {
         route: location.pathname,
         course_id: selectedCourseId,
         course_name: selectedCourse?.name ?? null,
+        module_id: activeConvo?.module_id ?? pendingPin?.id ?? null,
       };
-      const userMsg: ChatMessage = { id: -Date.now(), role: "user", content: msg };
-      setMessages((m) => {
-        // Mirror the server: this answer closes the most recent still-open
-        // clarify card (server stamps it on arrival; reload wins on conflict).
-        // Handles both card shapes and legacy cached role="clarify" rows.
-        let lastOpen = -1;
-        m.forEach((x, i) => {
-          const kind = x.role === "card" ? x.card?.kind : x.role;
-          if (kind !== "clarify") return;
-          const a = (x.card?.payload ?? x.tool_calls?.[0]?.args ?? {}) as { completed?: boolean };
-          if (!a.completed) lastOpen = i;
+      const userMsg: ChatMessage = {
+        id: -Date.now(), role: "user",
+        content: msg,
+        images: image ? [image] : null,
+      };
+      const targetConvo = activeConversationId;
+      if (targetConvo != null) {
+        updateThread(targetConvo, (m) => {
+          // Mirror the server: this answer closes the most recent still-open
+          // clarify card (server stamps it on arrival; reload wins on conflict).
+          // Handles both card shapes and legacy cached role="clarify" rows.
+          let lastOpen = -1;
+          m.forEach((x, i) => {
+            const kind = x.role === "card" ? x.card?.kind : x.role;
+            if (kind !== "clarify") return;
+            const a = (x.card?.payload ?? x.tool_calls?.[0]?.args ?? {}) as { completed?: boolean };
+            if (!a.completed) lastOpen = i;
+          });
+          const stamped = lastOpen === -1 ? m : m.map((x, i) => {
+            if (i !== lastOpen) return x;
+            const a = (x.card?.payload ?? x.tool_calls?.[0]?.args ?? {}) as Record<string, unknown>;
+            const stampedArgs = { ...a, completed: true, answer: msg };
+            if (x.role === "card" && x.card) {
+              return { ...x, card: { ...x.card, payload: stampedArgs } };
+            }
+            return { ...x, tool_calls: [{ tool: "clarify", args: stampedArgs }] };
+          });
+          return [...stamped, userMsg];
         });
-        const stamped = lastOpen === -1 ? m : m.map((x, i) => {
-          if (i !== lastOpen) return x;
-          const a = (x.card?.payload ?? x.tool_calls?.[0]?.args ?? {}) as Record<string, unknown>;
-          const stampedArgs = { ...a, completed: true, answer: msg };
-          if (x.role === "card" && x.card) {
-            return { ...x, card: { ...x.card, payload: stampedArgs } };
-          }
-          return { ...x, tool_calls: [{ tool: "clarify", args: stampedArgs }] };
-        });
-        const next = [...stamped, userMsg];
-        if (activeConversationId != null) writeCache(LS_MSGS(activeConversationId), next);
-        return next;
-      });
+      } else {
+        // New conversation: seed a local-only thread until the server
+        // answers with the real conversation id.
+        setSeed([userMsg]);
+      }
       try {
         const turn = await sendChatStream(msg, activeConversationId, (type, data) => {
           if (type === "token") setStreamText((t) => t + String(data.text ?? ""));
@@ -212,14 +236,27 @@ export function useChatThread() {
                 result_preview: (data.result_preview as string) ?? null,
               },
             ]);
-        }, uiContext);
+        }, uiContext, image ? [image] : undefined);
         if (activeConversationId == null) {
           setActiveConversationId(turn.conversation_id);
-          setConversations((c) => {
-            const next = [{ id: turn.conversation_id, title: msg.slice(0, 60) }, ...c];
-            writeCache(LS_CONVOS, next);
-            return next;
-          });
+          setSeed([]);
+          const stamped = pendingPin;
+          setPendingPin(null);
+          queryClient.setQueryData(
+            ["conversations"],
+            (prev: Conversation[] | undefined) => {
+              const next = [{
+                id: turn.conversation_id,
+                title: msg.slice(0, 60) || "Image question",
+                module_id: stamped?.id ?? null,
+                module_name: stamped?.name ?? null,
+              }, ...(prev ?? [])];
+              writeLS(LS_CONVOS, next);
+              return next;
+            }
+          );
+          // Move the locally-seeded user message into the real thread.
+          updateThread(turn.conversation_id, () => [userMsg]);
         }
         const assistant: ChatMessage = {
           id: Date.now(),
@@ -228,11 +265,7 @@ export function useChatThread() {
           tool_calls: turn.tool_calls,
           created_at: new Date().toISOString(),
         };
-        setMessages((m) => {
-          const next = [...m, assistant];
-          writeCache(LS_MSGS(turn.conversation_id), next);
-          return next;
-        });
+        updateThread(turn.conversation_id, (m) => [...m, assistant]);
         // Inline cards (quiz/clarify/review/todo/video): one construction
         // path for every kind — server persists them to the cards table,
         // so they restore on reload in display order.
@@ -245,12 +278,9 @@ export function useChatThread() {
         for (const { kind, payload } of newCards) {
           const messageId = (payload as { message_id: number }).message_id;
           const cardMsg = makeCard(messageId, kind, payload);
-          if (kind === "todo") setTodo(payload as TodoPayload);
-          setMessages((m) => {
+          updateThread(turn.conversation_id, (m) => {
             if (m.some((x) => x.id === cardMsg.id)) return m;
-            const next = [...m, cardMsg];
-            writeCache(LS_MSGS(turn.conversation_id), next);
-            return next;
+            return [...m, cardMsg];
           });
         }
         // Study timer: start replaces any running timer; stop logs the
@@ -279,14 +309,23 @@ export function useChatThread() {
           reloadTree,
           selectedCourseId,
         });
-    } catch (e) {
-      const detail = (e as Error).message;
-      notifyError(detail);
-      setMessages((m) => [
-        ...m,
-        { id: Date.now(), role: "assistant", content: `Something went wrong — ${detail}` },
-      ]);
-    } finally {
+        // Thread changed server-side (cards persisted) — revalidate in background.
+        queryClient.invalidateQueries({ queryKey: ["thread", turn.conversation_id] });
+        queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      } catch (e) {
+        const detail = (e as Error).message;
+        notifyError(detail);
+        const failedTurn: ChatMessage = {
+          id: Date.now(),
+          role: "assistant",
+          content: `Something went wrong — ${detail}`,
+        };
+        if (activeConversationId != null) {
+          updateThread(activeConversationId, (m) => [...m, failedTurn]);
+        } else {
+          setSeed((s) => [...s, failedTurn]);
+        }
+      } finally {
         setBusy(false);
         setStreamText("");
         setLiveTools([]);
@@ -303,7 +342,11 @@ export function useChatThread() {
       reloadTree,
       selectedCourseId,
       selectedCourse,
+      pendingPin,
+      conversations,
       persistTimer,
+      queryClient,
+      updateThread,
     ]
   );
 
@@ -327,6 +370,22 @@ export function useChatThread() {
   return {
     conversations,
     refreshList,
+    // Pin state: existing threads read the stored pin (server truth);
+    // new threads preview pendingPin until the first message stamps it.
+    activePin: activeConversationId == null
+      ? pendingPin
+      : (() => {
+          const c = conversations.find((x) => x.id === activeConversationId);
+          return c?.module_id != null
+            ? { id: c.module_id, name: c.module_name ?? `#${c.module_id}` }
+            : null;
+        })(),
+    pendingPin,
+    startPinned: (pin: { id: number; name: string } | null) => {
+      setPendingPin(pin);
+      setActiveConversationId(null);
+      setSeed([]);
+    },
     messages,
     busy,
     streamText,
@@ -346,12 +405,7 @@ export function useChatThread() {
         tool_calls: turn.tool_calls,
         created_at: new Date().toISOString(),
       };
-      if (turn.todo) setTodo(turn.todo);
-      setMessages((m) => {
-        const next = [...m, debrief];
-        writeCache(LS_MSGS(turn.conversation_id), next);
-        return next;
-      });
+      updateThread(turn.conversation_id, (m) => [...m, debrief]);
       runUiActions(turn.ui_actions ?? [], {
         navigate,
         selectCourse,
@@ -363,9 +417,11 @@ export function useChatThread() {
     retry: async () => {
       if (busy) return;
       const lastUser = [...messages].reverse().find((m) => m.role === "user");
-      if (!lastUser) return;
+      if (!lastUser || activeConversationId == null) return;
       // Drop the failed assistant reply ahead of the resend.
-      setMessages((m) => m.filter((x) => !(x.role === "assistant" && x.id > lastUser.id)));
+      updateThread(activeConversationId, (m) =>
+        m.filter((x) => !(x.role === "assistant" && x.id > lastUser.id))
+      );
       await send(lastUser.content);
     },
   };

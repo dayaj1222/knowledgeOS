@@ -8,11 +8,11 @@ honor the confirm-in-chat rule via the `confirmed` arg.
 from __future__ import annotations
 
 import re
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from .. import models
 from ..config import settings
@@ -26,95 +26,137 @@ from ..services import (
     StudyService,
 )
 from ..services.review_service import score_to_quality
+from .tool_args import (
+    AskClarifyArgs,
+    AskReviewArgs,
+    FindVideosArgs,
+    GenerateQuizArgs,
+    PlotChartArgs,
+    RecordUnderstandingArgs,
+    RunCodeArgs,
+    ShowDemoArgs,
+    StartTimerArgs,
+    UpdateTodoArgs,
+)
+from .tool_policy import tool_enabled
+from .tool_visuals import plot_chart, run_code, show_demo
 from .web import fetch_transcript as _fetch_transcript
 from .web import fetch_url as _fetch_url
 from .web import score_relevance as _score_relevance
 from .web import search_videos as _search_videos
 from .web import search_web as _search_web
+from .web import select_transcript_moment as _select_transcript_moment
+
+# Current turn's conversation id (set by tutor.py around each tool call).
+# Lets convo-scoped tools (set_context) act without signature churn.
+current_conversation: ContextVar[int | None] = ContextVar(
+    "current_conversation", default=None
+)
+
+
+def _resolve_pin(db, user_id: int, module_id) -> Any:
+    """Validate a pin target: module exists in one of the user's courses."""
+    if module_id is None:
+        return None
+    try:
+        mid = int(module_id)
+    except (TypeError, ValueError):
+        return {"error": "module_id must be an int or null"}
+    module = db.get(models.Module, mid)
+    if module is None:
+        return {"error": "unknown_module"}
+    course = db.get(models.Course, module.course_id)
+    if course is None or course.user_id != user_id:
+        return {"error": "module not in your library"}
+    return module
+
+
+def set_context(db, user_id: int, args: dict) -> dict:
+    """Pin/re-pin/unpin the module for THIS conversation (permanent until
+    changed again on the learner's words). module_id null clears the pin."""
+    conv_id = current_conversation.get()
+    if conv_id is None:
+        return {"error": "no active conversation"}
+    conv = db.get(models.Conversation, conv_id)
+    if conv is None or conv.user_id != user_id:
+        return {"error": "Conversation not found"}
+    module = _resolve_pin(db, user_id, args.get("module_id"))
+    if isinstance(module, dict):
+        return module
+    conv.module_id = module.id if module is not None else None
+    return {"pinned": module.name if module is not None else None}
 
 
 def _needs_confirmation(action: str, params: dict) -> dict:
     return {"needs_confirmation": True, "action": action, "params": params}
 
 
-# ---------- typed args (runtime validation at dispatch) ----------
-# NOTE: these mirror runtime behavior (defaults, coercions), NOT the
-# aspirational hand-written JSON schemas in TOOLS (which carry richer
-# per-field docs for the model). A test locks field parity so they can't
-# drift apart silently. New tools MUST declare an args model.
+# ---------- read-only: module-pool RAG ----------
+# Passages are NEVER filed under topics. Each module's chunks form one pool;
+# retrieval ranks within the pool (vector first, keyword fallback) and the
+# LLM expands context by contiguous index_order ranges when a hit is partial.
+# Pool + ranking live in services.retrieval (shared with quiz grounding).
+
+def _fmt_chunk(p, match: str) -> dict:
+    return {
+        "id": p.id, "resource_id": p.resource_id, "index_order": p.index_order,
+        "pages": [p.page_start, p.page_end], "section": p.section_path,
+        "match": match, "content": p.content[:1200],
+    }
 
 
-class RecordUnderstandingArgs(BaseModel):
-    topic_id: int
-    demonstrated: float = 0.8
-    coverage: float = 0.2
-    evidence: str = ""
-    confirmed: bool = False
+def _rank_pool(db, query: str, passages: list, top: int) -> list[dict]:
+    from ..services.retrieval import rank_pool
+
+    return [_fmt_chunk(p, match) for p, match in rank_pool(db, query, passages, top)]
 
 
-class UpdateTodoArgs(BaseModel):
-    todos: list[dict]
-    confirmed: bool = False
+def _module_pool(db, module_id: int) -> tuple[list, Any]:
+    from ..services.retrieval import module_pool
+
+    return module_pool(db, module_id)
 
 
-class GenerateQuizArgs(BaseModel):
-    topic_ids: list[int] = Field(default_factory=list)
-    count_per_topic: int | None = None
-    difficulty: str | None = None
-    confirmed: bool = False
-
-
-class AskClarifyArgs(BaseModel):
-    question: str = ""
-    options: list[str] = Field(default_factory=list)
-    allow_free_text: bool = True
-
-
-class AskReviewArgs(BaseModel):
-    items: list[dict]
-
-
-class FindVideosArgs(BaseModel):
-    query: str
-    count: int | None = None
-    topic_id: int | None = None
-
-
-class StartTimerArgs(BaseModel):
-    topic_id: int
-    label: str = ""
-
-
-# ---------- read-only ----------
-
-def search_knowledge(db, user_id: int, args: dict) -> list[dict]:
+def search_module(db, user_id: int, args: dict) -> list[dict] | dict:
+    """Vector search over ONE module's chunk pool. The primary RAG entry:
+    initial grounding injection. Ask for more detail via get_passage_range."""
+    module_id = int(args["module_id"])
     query = str(args.get("query", ""))
-    limit = min(int(args.get("limit", 5)), 15)
-    like = f"%{query}%"
-    out: list[dict] = []
-    for p in db.scalars(
-        select(models.Passage).where(models.Passage.content.ilike(like)).limit(limit)
-    ).all():
-        out.append(
-            {
-                "kind": "passage",
-                "id": p.id,
-                "topic_id": p.topic_id,
-                "pages": [p.page_start, p.page_end],
-                "snippet": p.content[:400],
-            }
+    limit = min(int(args.get("limit", 6)), 12)
+    passages, module = _module_pool(db, module_id)
+    if module is None:
+        return {"error": "unknown_module"}
+    return _rank_pool(db, query, passages, limit)
+
+
+def get_passage_range(db, user_id: int, args: dict) -> list[dict] | dict:
+    """Contiguous chunk slice of one file by index_order (inclusive).
+
+    Context expansion: a search hit at index_order N with partial content
+    → fetch (N-2, N+2). Window hard-capped at 15 chunks.
+    """
+    try:
+        resource_id = int(args["resource_id"])
+        start = int(args["start"])
+        end = int(args["end"])
+    except (KeyError, TypeError, ValueError):
+        return {"error": "resource_id, start, and end (int) are required"}
+    if start > end:
+        return {"error": "start must be <= end"}
+    if end - start + 1 > 15:
+        end = start + 14
+    if start < 0:
+        return {"error": "start must be >= 0"}
+    passages = db.scalars(
+        select(models.Passage)
+        .where(
+            models.Passage.resource_id == resource_id,
+            models.Passage.index_order >= start,
+            models.Passage.index_order <= end,
         )
-    for t in db.scalars(
-        select(models.Topic).where(models.Topic.name.ilike(like)).limit(limit)
-    ).all():
-        out.append({"kind": "topic", "id": t.id, "name": t.name})
-    for q in db.scalars(
-        select(models.Question).where(models.Question.text.ilike(like)).limit(limit)
-    ).all():
-        out.append(
-            {"kind": "question", "id": q.id, "topic_id": q.topic_id, "text": q.text[:300]}
-        )
-    return out[: limit * 2]
+        .order_by(models.Passage.index_order)
+    ).all()
+    return [_fmt_chunk(p, "context") for p in passages]
 
 
 def list_courses(db, user_id: int, args: dict) -> list[dict]:
@@ -137,19 +179,14 @@ def course_tree(db, user_id: int, course_id: int) -> dict | None:
             select(models.Proficiency).where(models.Proficiency.user_id == user_id)
         ).all()
     }
-    counts = dict(
-        db.execute(
-            select(models.Passage.topic_id, func.count(models.Passage.id))
-            .join(models.Resource, models.Passage.resource_id == models.Resource.id)
-            .where(models.Resource.user_id == user_id)
-            .group_by(models.Passage.topic_id)
-        ).all()
-    )
     modules = db.scalars(
         select(models.Module)
         .where(models.Module.course_id == course_id)
         .order_by(models.Module.order_index, models.Module.id)
     ).all()
+    from ..services.retrieval import pool_counts as _pool_counts
+
+    counts = _pool_counts(db, [m.id for m in modules])
     out_modules = []
     for m in modules:
         topics = db.scalars(
@@ -166,7 +203,7 @@ def course_tree(db, user_id: int, course_id: int) -> dict | None:
                         "id": t.id,
                         "name": t.name,
                         "score": scores.get(t.id),
-                        "passages": counts.get(t.id, 0),
+                        "passages": counts.get(m.id, 0),
                     }
                     for t in topics
                 ],
@@ -189,18 +226,22 @@ def get_course_tree(db, user_id: int, args: dict) -> dict:
     return tree
 
 
-def get_passages(db, user_id: int, args: dict) -> list[dict]:
+def get_passages(db, user_id: int, args: dict) -> list[dict] | dict:
+    """Topic grounding WITHOUT filing: rank the topic's MODULE pool by the
+    topic's own name+description. Same result shape as before, so the tutor,
+    quiz grounding, and frontend keep working unchanged."""
+    topic_id = int(args["topic_id"])
     limit = min(int(args.get("limit", 6)), 12)
-    passages = db.scalars(
-        select(models.Passage)
-        .where(models.Passage.topic_id == int(args["topic_id"]))
-        .order_by(models.Passage.index_order)
-        .limit(limit)
-    ).all()
-    return [
-        {"id": p.id, "pages": [p.page_start, p.page_end], "section": p.section_path, "content": p.content[:1200]}
-        for p in passages
-    ]
+    topic = db.get(models.Topic, topic_id)
+    if topic is None:
+        return {"error": "unknown_topic"}
+    if topic.module_id is None:
+        return []
+    passages, module = _module_pool(db, topic.module_id)
+    if module is None:
+        return []
+    query = topic.name + " " + (topic.description or "")
+    return _rank_pool(db, query, passages, limit)
 
 
 def get_proficiency(db, user_id: int, args: dict) -> list[dict]:
@@ -342,19 +383,27 @@ def fetch_url(db, user_id: int, args: dict) -> dict:
 
 
 def find_videos(db, user_id: int, args: dict) -> dict:
-    """Find YouTube videos for a topic — renders INLINE as embedded players.
-    No confirmation needed. Max 3 per call.
+    """Choose one best YouTube video after transcript-based comparison.
 
-    Pass topic_id to VERIFY each video: its caption track is fetched and
-    scored against the topic's own passages (keyword overlap). Verified
-    videos genuinely cover the topic; the rest are flagged, not dropped —
-    the tutor presents verified ones first and says so.
+    A small candidate set is checked against the topic's passages, but only
+    the best unseen result renders. Later calls in the same conversation
+    rotate to the next candidate instead of repeating a video.
     """
     query = str(args.get("query", "")).strip()
     if not query:
         return {"error": "query must be non-empty (topic + concept, e.g. 'priority ceiling protocol explained')"}
     try:
-        count = max(1, min(int(args.get("count", 3)), 5))
+        topic_id = int(args["topic_id"])
+    except (KeyError, TypeError, ValueError):
+        return {
+            "videos": [],
+            "error": "topic_id is required so captions can be verified against the learner's material",
+        }
+    topic = db.get(models.Topic, topic_id)
+    if topic is None:
+        return {"videos": [], "error": f"topic {topic_id} not found; cannot verify captions"}
+    try:
+        count = max(3, min(int(args.get("count", 3)), 5))
     except (TypeError, ValueError):
         count = 3
     result = _search_videos(query, count)
@@ -362,47 +411,66 @@ def find_videos(db, user_id: int, args: dict) -> dict:
     if not videos:
         return {"videos": [], "hint": "No videos found — teach from passages instead."}
     # Verification: caption track vs the topic's own text.
-    topic_text = ""
-    topic_name = ""
-    try:
-        topic_id = int(args.get("topic_id")) if args.get("topic_id") is not None else None
-    except (TypeError, ValueError):
-        topic_id = None
-    if topic_id is not None:
-        topic = db.get(models.Topic, topic_id)
-        if topic is not None:
-            topic_name = topic.name or ""
-            parts = [topic_name, topic.description or ""]
-            for p in db.scalars(
-                select(models.Passage)
-                .where(models.Passage.topic_id == topic_id)
-                .order_by(models.Passage.index_order)
-                .limit(6)
-            ).all():
-                parts.append((p.content or "")[:800])
-            topic_text = "\n".join(parts)
+    from ..services.retrieval import grounding_for_topic
+
+    topic_name = topic.name or ""
+    parts = [topic_name, topic.description or ""]
+    parts.extend(c[:800] for c in grounding_for_topic(db, topic))
+    topic_text = "\n".join(parts)
+    verified_videos: list[dict] = []
     for v in videos:
-        v["verified"] = False
-        v["relevance"] = 0.0
-        if not topic_text:
-            continue
         tr = _fetch_transcript(v["video_id"])
         if tr.get("error") or not tr.get("full_text"):
-            v["verify_note"] = tr.get("error", "no transcript")[:120]
             continue
         scored = _score_relevance(tr["full_text"], topic_text, topic_name)
         v["relevance"] = scored["relevance"]
         v["matched"] = scored["matched"]
         v["verified"] = scored["relevance"] >= 0.3
-    videos.sort(key=lambda v: (v["verified"], v["relevance"]), reverse=True)
+        if v["verified"]:
+            moment = _select_transcript_moment(
+                tr.get("segments") or [], query, topic_text
+            )
+            if moment:
+                v.update(moment)
+            verified_videos.append(v)
+    verified_videos.sort(key=lambda v: v["relevance"], reverse=True)
+    if not verified_videos:
+        return {
+            "type": "video",
+            "videos": [],
+            "hint": "No candidate had captions that could be verified against this topic's material.",
+        }
+    # Video cards are persisted after each completed turn, giving a durable
+    # per-conversation history for "show me another" requests.
+    shown: set[str] = set()
+    conv_id = current_conversation.get()
+    if conv_id is not None:
+        for card in db.scalars(select(models.Card).where(
+            models.Card.conversation_id == conv_id,
+            models.Card.kind == "video",
+        )).all():
+            shown.update(
+                str(video.get("video_id"))
+                for video in (card.payload or {}).get("videos", [])
+                if isinstance(video, dict) and video.get("video_id")
+            )
+    selected = next((video for video in verified_videos if str(video.get("video_id")) not in shown), None)
+    if selected is None:
+        return {
+            "type": "video",
+            "videos": [],
+            "hint": "All transcript-ranked candidates were already shown; refine the topic or query.",
+        }
     return {
         "type": "video",
-        "videos": videos,
+        "videos": [selected],
+        "candidates_checked": len(videos),
         "hint": (
-            "These render INLINE as embedded players. Present VERIFIED videos "
-            "first (their captions match the syllabus); say plainly when one "
-            "is unverified. Introduce in 1-2 sentences (which video covers "
-            "what), then end with: VIDEO_READY — do NOT paste raw URLs."
+            "This is the single best unseen candidate after transcript ranking "
+            "and syllabus verification. If the learner asks for another, "
+            "call this tool again to return the next best unseen result. "
+            "Introduce it in 1-2 sentences, then end with: VIDEO_READY — do "
+            "NOT paste raw URLs."
         ),
     }
 
@@ -884,11 +952,28 @@ TOOLS: dict[str, dict[str, Any]] = {
         "parameters": {"type": "object", "properties": {"action": {"type": "string"}, "params": {"type": "object"}}, "required": ["action"]},
         "run": lambda db, user_id, args: {"queued": True, **{k: v for k, v in args.items() if k != 'confirmed'}},
     },
-    "search_knowledge": {
-        "signature": '(query: str, limit?: int)',
-        "description": "Full-text search over passages, topics, and questions.",
-        "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]},
-        "run": search_knowledge,
+    "search_module": {
+        "signature": '(module_id: int, query: str, limit?: int)',
+        "description": (
+            "Vector search over ONE module's chunk pool (course-level material "
+            "included). The primary RAG entry: initial grounding injection. "
+            "When a hit looks truncated or mid-argument, expand with "
+            "get_passage_range BEFORE answering. Never search outside the "
+            "active module unless the student asks cross-module."
+        ),
+        "parameters": {"type": "object", "properties": {"module_id": {"type": "integer"}, "query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["module_id", "query"]},
+        "run": search_module,
+    },
+    "get_passage_range": {
+        "signature": '(resource_id: int, start: int, end: int)',
+        "description": (
+            "Contiguous chunk slice of one file by index_order, inclusive, "
+            "max 15 chunks. Context expansion: a search hit at index N with "
+            "partial content → fetch (N-2, N+2). Call BEFORE answering from "
+            "a truncated hit."
+        ),
+        "parameters": {"type": "object", "properties": {"resource_id": {"type": "integer"}, "start": {"type": "integer"}, "end": {"type": "integer"}}, "required": ["resource_id", "start", "end"]},
+        "run": get_passage_range,
     },
     "web_search": {
         "signature": '(query: str, count?: int)',
@@ -913,19 +998,58 @@ TOOLS: dict[str, dict[str, Any]] = {
     "find_videos": {
         "signature": '(query: str, count?: int, topic_id?: int)',
         "description": (
-            "Find YouTube videos for a topic — renders INLINE as embedded "
+            "Find one YouTube video for a topic — renders INLINE as an embedded "
             "players in the chat (thumbnail → click to play). Pass topic_id "
-            "to VERIFY each video against the topic's passages (caption-track "
-            "overlap; verified ones genuinely cover the syllabus). Use when "
+            "to VERIFY candidates against the topic's passages (caption-track "
+            "overlap); unverified candidates are never returned. Use when "
             "the learner is stuck after explanations, asks for a video/visual, "
             "or a concept cries out for animation (protocols, algorithms, "
-            "waveforms). Query with topic + concept words. Max 3-5 per call. "
-            "No confirmation needed. Videos supplement the stored passages, "
-            "never replace them — say which part each covers."
+            "waveforms). The tool compares a small candidate set, but returns "
+            "ONE best unseen video per call; call it again only when the learner "
+            "asks for another. Query with topic + concept words. No confirmation "
+            "needed. Videos supplement the stored passages, never replace them."
         ),
         "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "count": {"type": "integer"}, "topic_id": {"type": "integer"}}, "required": ["query"]},
         "run": find_videos,
         "args_model": FindVideosArgs,
+    },
+    "show_demo": {
+        "signature": '(title?: str, html: str, height?: int)',
+        "description": (
+            "Interactive intuition demo — renders INLINE as a sandboxed "
+            "iframe card (sliders, animations, step-throughs). html is ONE "
+            "self-contained document (inline CSS+JS, canvas/SVG, ≤30KB, zero "
+            "external URLs). Use when they need to SEE it move (sampling, "
+            "distributions, processes). One demo per turn max."
+        ),
+        "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "html": {"type": "string"}, "height": {"type": "integer"}}, "required": ["html"]},
+        "run": show_demo,
+        "args_model": ShowDemoArgs,
+    },
+    "run_code": {
+        "signature": '(code: str, timeout?: float)',
+        "description": (
+            "Compute tier: run Python (stdlib + numpy + scipy), stdout only, "
+            "30s timeout. Verify/solve numbers BEFORE claiming them "
+            "(critical values, p-values, solved results). Output wins over "
+            "drafts. No files, no plots — static figures are plot_chart."
+        ),
+        "parameters": {"type": "object", "properties": {"code": {"type": "string"}, "timeout": {"type": "number"}}, "required": ["code"]},
+        "run": run_code,
+        "args_model": RunCodeArgs,
+    },
+    "plot_chart": {
+        "signature": '(code: str, title?: str, timeout?: float)',
+        "description": (
+            "Static-figure tier: run matplotlib (Agg) and render INLINE as "
+            "a figure card. Code must save to output.png. Exact figures "
+            "only (distributions, rejection regions, comparisons) — "
+            "moving intuition belongs to show_demo. Describe in 1-2 "
+            "sentences, end with its token."
+        ),
+        "parameters": {"type": "object", "properties": {"code": {"type": "string"}, "title": {"type": "string"}, "timeout": {"type": "number"}}, "required": ["code"]},
+        "run": plot_chart,
+        "args_model": PlotChartArgs,
     },
     "list_courses": {
         "signature": '()',
@@ -946,9 +1070,23 @@ TOOLS: dict[str, dict[str, Any]] = {
         "parameters": {"type": "object", "properties": {"course_id": {"type": "integer"}}, "required": ["course_id"]},
         "run": get_course_tree,
     },
+    "set_context": {
+        "signature": '(module_id?: int | null)',
+        "description": (
+            "Pin this conversation to a module (permanent until changed on "
+            "the learner's words), or unpin with null. Call only when they "
+            "ask to switch modules or unpin — never on your own."
+        ),
+        "parameters": {"type": "object", "properties": {"module_id": {"type": ["integer", "null"]}}},
+        "run": set_context,
+    },
     "get_passages": {
         "signature": '(topic_id: int, limit?: int)',
-        "description": "Fetch stored passage text for a topic to ground explanations.",
+        "description": (
+            "Grounding for a topic: ranks the topic's MODULE pool (vector "
+            "search, no per-topic filing). Same shape as module search hits. "
+            "Expand partial hits with get_passage_range before answering."
+        ),
         "parameters": {"type": "object", "properties": {"topic_id": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["topic_id"]},
         "run": get_passages,
     },
@@ -1146,8 +1284,10 @@ TOOLS: dict[str, dict[str, Any]] = {
             "present-continuous label ('Building quiz'). For topic study, "
             "open the plan at session start with one step per subtopic and a "
             "weight per step (share of the whole topic; normalized to sum "
-            "1.0, equal splits if omitted) — then score each finished "
-            "subtopic with record_understanding using coverage = its weight, "
+            "1.0, equal splits if omitted) — the learner owns the pace: never "
+            "complete a step yourself; only when THEY say done, grade that "
+            "subtopic (quiz drill), score it with record_understanding using "
+            "coverage = weight × demonstrated, and tick it complete — "
             "so the topic score is the fair sum of weight × demonstrated. "
             "No confirmation needed; never paste the list in text."
         ),
@@ -1157,11 +1297,12 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
 }
 
-
 def run_tool(db, user_id: int, name: str, args: dict) -> Any:
     spec = TOOLS.get(name)
     if spec is None:
         return {"error": f"unknown tool '{name}'"}
+    if not tool_enabled(name):
+        return {"error": f"tool '{name}' is disabled by local agent policy"}
     args = args or {}
     model = spec.get("args_model")
     if model is not None:
@@ -1186,4 +1327,5 @@ def openai_tools() -> list[dict]:
             },
         }
         for name, spec in TOOLS.items()
+        if tool_enabled(name)
     ]

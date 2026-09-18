@@ -10,17 +10,41 @@ Fallback ladder when markitdown yields nothing:
 2. tesseract OCR for scanned PDFs (page provenance lost → single page).
 3. marker-pdf for handwriting/equations (heavy, opt-in, may be absent).
 
-Embedded figures (diagrams, scanned figures) are OCRed per page and appended
-as typed <image-text> blocks — OCR only ever describes images, never prose.
+Embedded figures (diagrams, scanned figures) are vision-described per
+image (tesseract fallback) on EVERY pdf path — markitdown or fallback —
+and appended as typed <image-text> blocks with page attribution.
+
+Embedded figures (diagrams, scanned figures) are described per image through
+the vision-capable chat endpoint (OpenAI-compatible, image_url parts) and
+stored as typed <image-text> blocks. Tesseract OCR is the per-image fallback
+when vision is unreachable — callers treat "no image text" as skip, never as
+failure.
 
 Every tool runs as a subprocess; if a tool is missing, degrade rather than crash.
 """
 
 from __future__ import annotations
 
+import base64
 import shutil
 import subprocess
 from pathlib import Path
+
+VISION_PROMPT = (
+    "Describe ONLY the document figure in this image (diagram, chart, "
+    "table, photo, or screenshot OF DOCUMENT CONTENT). "
+    "IGNORE browser chrome, PDF viewer toolbars, tabs, address bars, "
+    "taskbars, window frames, and page numbers — never transcribe them. "
+    "If the image has no meaningful figure (blank, logo fragment, single "
+    "glyph, decorative line, icon), reply with exactly: NO_CONTENT. "
+    "Otherwise give: the type of visual; every text label and value you "
+    "can actually READ — never invent text, mark unreadable parts "
+    "[illegible]; axes and legend if any; relationships and arrows shown. "
+    "Literal transcription, no interpretation."
+)
+NO_CONTENT = "NO_CONTENT"
+VISION_TIMEOUT = 240.0  # seconds per image; vision backends can be slow
+MAX_IMAGES_PER_PAGE = 6
 
 
 def _have(cmd: str) -> bool:
@@ -87,34 +111,172 @@ def _ocr_pdf(path: Path) -> str:
     return "\n\n".join(parts)
 
 
-MAX_IMAGES_PER_PAGE = 6
+def _ocr_image_file(img: Path) -> str:
+    """Tesseract fallback for a single extracted image file."""
+    if not _have("tesseract"):
+        return ""
+    try:
+        r = subprocess.run(
+            ["tesseract", str(img), "stdout", "-l", "eng"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        return ""
+    return r.stdout.strip()
 
 
-def _ocr_embedded_images(path: Path, page: int) -> list[str]:
-    """OCR the images embedded in one PDF page (diagrams, scanned figures).
+def _describe_image_vision(png: bytes, thread_id: str | None = None) -> str:
+    """Describe one image via the vision chat endpoint (OpenAI image_url).
 
-    Returns the non-empty OCR texts in page order. Empty list when the tools
-    are missing or the page holds no readable images — callers treat this as
-    "no image text", never as failure.
+    thread_id pins the turn to one proxy connection; callers rotate a
+    small pool of ids so parallel workers land on parallel connections.
+    Returns "" on any failure — the caller falls back to tesseract.
+    A literal NO_CONTENT reply (decorative/blank image) also yields "".
     """
-    if not (_have("pdfimages") and _have("tesseract")):
+    try:
+        import httpx
+
+        from ..ai import LLM_BASE_URL, LLM_MODEL
+    except Exception:
+        return ""
+    b64 = base64.b64encode(png).decode()
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": VISION_PROMPT},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ],
+        }],
+    }
+    if thread_id:
+        payload["thread_id"] = thread_id
+    try:
+        with httpx.Client(timeout=VISION_TIMEOUT) as client:
+            r = client.post(f"{LLM_BASE_URL}/chat/completions", json=payload)
+        r.raise_for_status()
+        text = str(r.json()["choices"][0]["message"]["content"] or "").strip()
+        return "" if text.strip() == NO_CONTENT else text
+    except Exception:
+        return ""
+
+
+MIN_IMAGE_DIM = 120  # px; below this are glyphs/lines, not figures
+MIN_IMAGE_BYTES = 10240  # 10 KB; below this are spacers/glyphs/logos — too small
+# to carry a describable figure, so skip before paying a vision call
+
+
+def _image_dims(path: Path, page: int) -> list[tuple[int, int]]:
+    """(width, height) per image on the page, in `pdfimages -list` order.
+
+    `-list` prints no filenames, but rows follow extraction sequence, so
+    row i matches img-{i:03d}.png. Empty list when the tool is missing —
+    callers then keep every image.
+    """
+    try:
+        r = subprocess.run(
+            ["pdfimages", "-list", "-f", str(page), "-l", str(page), str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
         return []
+    dims: list[tuple[int, int]] = []
+    for line in r.stdout.splitlines()[2:]:  # skip 2 header lines
+        parts = line.split()
+        # cols: page num type width height color ...
+        if len(parts) >= 6:
+            try:
+                dims.append((int(parts[3]), int(parts[4])))
+            except ValueError:
+                continue
+    return dims
+
+
+VISION_THREADS = 3  # parallel proxy connections; rotate image turns across them
+
+
+def _new_vision_threads(n: int = VISION_THREADS) -> list[str]:
+    """Random thread ids, one per proxy connection (parallel uploads)."""
+    import secrets
+
+    return [secrets.token_hex(8) for _ in range(n)]
+
+
+def _page_image_texts(
+    path: Path,
+    page: int,
+    threads: list[str] | None = None,
+    counter: object = None,
+) -> list[str]:
+    """Vision-describe every embedded image on one PDF page, in order.
+
+    Images run on a 3-worker pool with turns rotated across the given
+    thread ids (one proxy connection each). Falls back to tesseract per
+    image when vision yields nothing. Empty list when the tools are
+    missing or the page holds no images.
+    """
+    if not _have("pdfimages"):
+        return []
+    import itertools
+    import logging
+    from concurrent.futures import ThreadPoolExecutor
+
+    log = logging.getLogger(__name__)
     from tempfile import TemporaryDirectory
     texts: list[str] = []
+    stats = {"vision": 0, "ocr": 0, "skipped_small": 0, "empty": 0}
+    threads = threads or []
+    count = counter if counter is not None else itertools.count()
+
+    def describe_one(img: Path) -> str:
+        tid = threads[next(count) % len(threads)] if threads else None
+        try:
+            text = _describe_image_vision(img.read_bytes(), tid)
+        except Exception:
+            text = ""
+        if text:
+            return ("vision", text)
+        text = _ocr_image_file(img)
+        return ("ocr" if text else "empty", text)
+
     with TemporaryDirectory() as td:
         tdp = Path(td)
-        subprocess.run(
-            ["pdfimages", "-png", "-f", str(page), "-l", str(page),
-             str(path), str(tdp / "img")],
-            capture_output=True, timeout=120,
-        )
-        for img in sorted(tdp.glob("img-*.png"))[:MAX_IMAGES_PER_PAGE]:
-            r = subprocess.run(
-                ["tesseract", str(img), "stdout", "-l", "eng"],
-                capture_output=True, text=True, timeout=60,
+        try:
+            subprocess.run(
+                ["pdfimages", "-png", "-f", str(page), "-l", str(page),
+                 str(path), str(tdp / "img")],
+                capture_output=True, timeout=120,
             )
-            if r.stdout.strip():
-                texts.append(r.stdout.strip())
+        except Exception:
+            return []
+        # Largest first: glyphs and line fragments sort last, so the
+        # per-page cap keeps real figures instead of crowding them out.
+        # -list rows follow extraction sequence = img-{i:03d} name order.
+        ordered = sorted(tdp.glob("img-*.png"))
+        dims = _image_dims(path, page)
+        sized = []
+        for i, img in enumerate(ordered):
+            if img.stat().st_size < MIN_IMAGE_BYTES:
+                stats["skipped_small"] += 1
+                continue
+            if dims and i < len(dims):
+                w, h = dims[i]
+                if w < MIN_IMAGE_DIM or h < MIN_IMAGE_DIM:
+                    stats["skipped_small"] += 1
+                    continue
+            sized.append(img)
+        imgs = sorted(sized, key=lambda p: p.stat().st_size, reverse=True)
+        targets = imgs[:MAX_IMAGES_PER_PAGE]
+        with ThreadPoolExecutor(max_workers=VISION_THREADS) as pool:
+            # executor.map preserves input order → texts stay in size order.
+            for kind, text in pool.map(describe_one, targets):
+                stats[kind] += 1
+                if text:
+                    texts.append(text)
+    if any(stats.values()):
+        log.info("page_images page=%s %s", page, stats)
     return texts
 
 
@@ -128,19 +290,24 @@ def _markitdown(path: Path) -> str:
 
 
 def _figure_blocks(path: Path) -> list[str]:
-    """OCR embedded figures page by page (pdfs only) as typed blocks.
+    """Describe embedded figures page by page (pdfs only) as typed blocks.
 
-    Needs only pdfinfo (page count) + pdfimages/tesseract — no text layer.
-    Returns [] when tools are missing or no figure text is found.
+    Needs only pdfinfo (page count) + pdfimages + vision endpoint (tesseract
+    fallback) — no text layer. Returns [] when tools are missing or no
+    figure text is found.
     """
     if path.suffix.lower() != ".pdf":
         return []
     pages = _pdfinfo_pages(path)
     if pages <= 0:
         return []
+    import itertools
+
+    threads = _new_vision_threads()  # 3 ids, rotated across parallel turns
+    count = itertools.count()
     out: list[str] = []
     for page in range(1, pages + 1):
-        for i, text in enumerate(_ocr_embedded_images(path, page), 1):
+        for i, text in enumerate(_page_image_texts(path, page, threads, count), 1):
             out.append(
                 f'<image-text page="{page}" image="{i}">\n{text}\n</image-text>'
             )
@@ -185,9 +352,14 @@ def extract_text(path: Path, file_type: str) -> tuple[str, str, list[tuple[int, 
     is_pdf = path.suffix.lower() == ".pdf" or (file_type or "").lower() == "pdf"
     if is_pdf:
         # Fallback restores page provenance when markitdown finds nothing.
+        # Figures still get vision descriptions — image extraction is
+        # independent of which text path won.
         pages = _pdftotext_per_page(path)
         text = "\n\n".join(t for _, t in pages)
         if text.strip() and len(pages) > 0:
+            figures = _figure_blocks(path)
+            if figures:
+                text = text + "\n\n" + "\n\n".join(figures)
             return text, "ok", pages
 
         # No usable text layer — try OCR (page provenance lost → single page)

@@ -129,6 +129,28 @@ def get_preference(user_id: int, db: Session = Depends(get_db)):
     return ok(_dump(schemas.PreferenceOut, pref))
 
 
+@router.get("/users/{user_id}/system-prompt")
+def get_system_prompt(user_id: int, db: Session = Depends(get_db)):
+    """Return the ACTUAL tutor system prompt for this user.
+
+    Single source of truth: assembled by prompt.build_system_prompt from the
+    saved Preference (style/verbosity/instructions). What this returns is
+    what the model receives as the `system` message (before the static
+    library structure, which is per-conversation and appended at runtime).
+    """
+    from ..agent.prompt import build_system_prompt
+
+    pref = db.scalar(
+        select(models.Preference).where(models.Preference.user_id == user_id)
+    )
+    prompt = build_system_prompt(
+        style=getattr(pref, "tutor_style", None),
+        verbosity=getattr(pref, "tutor_verbosity", None),
+        instructions=getattr(pref, "tutor_instructions", None),
+    )
+    return ok({"system_prompt": prompt})
+
+
 @router.put("/users/{user_id}/preference")
 def upsert_preference(
     user_id: int, payload: schemas.PreferenceUpdate, db: Session = Depends(get_db)

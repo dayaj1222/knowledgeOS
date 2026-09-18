@@ -51,10 +51,12 @@ class QuizService:
     # ---- question synthesis ----
     @staticmethod
     def _grounding_passages(db: Session, topic_id: int) -> list[str]:
-        passages = db.scalars(
-            select(models.Passage).where(models.Passage.topic_id == topic_id)
-        ).all()
-        return [p.content for p in passages]
+        from .retrieval import grounding_for_topic
+
+        topic = db.get(models.Topic, topic_id)
+        if topic is None:
+            return []
+        return grounding_for_topic(db, topic)
 
     @staticmethod
     def generate_for_topic(

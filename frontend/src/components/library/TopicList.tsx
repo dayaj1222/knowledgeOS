@@ -79,12 +79,12 @@ export function TopicList({
               </button>
             </div>
 
-            {/* Line 2: priority + passages */}
+            {/* Line 2: priority + chunks */}
             <div className="flex items-center gap-2 flex-wrap">
               <PriorityChip priority={t.priority} />
               <span className="text-[10px] text-muted-foreground font-mono flex items-center gap-1">
                 <FileText size={10} className="text-muted-foreground" />
-                {t.passage_count ?? 0} {t.passage_count === 1 ? "passage" : "passages"}
+                {t.passage_count ?? 0} {t.passage_count === 1 ? "chunk" : "chunks"}
               </span>
             </div>
 

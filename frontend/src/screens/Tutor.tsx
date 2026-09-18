@@ -9,6 +9,8 @@ import {
   Check,
   Copy,
   History,
+  Pin,
+  PinOff,
   Plus,
   Reply,
   Search,
@@ -27,6 +29,7 @@ import {
   getDueReviews,
   getMemories,
   getPreference,
+  pinConversation,
   putPreference,
   type TutorMemory,
 } from "../api";
@@ -37,40 +40,9 @@ import Markdown from "../components/Markdown";
 import TodoGraph from "../components/TodoGraph";
 import { renderCard } from "../components/cardRegistry";
 import { cardKind } from "../api";
-import ToolCalls from "../components/ToolCalls";
+import ToolCalls, { ToolActivity } from "../components/ToolCalls";
 import ChatComposer from "../components/ChatComposer";
-
-const SUGGESTIONS = [
-  "Quiz me on my weakest topic",
-  "What should I revise today?",
-  "Explain the last thing I got wrong",
-  "Plan my study week",
-];
-
-// User bubble text: leading "> " quote lines (from quote-reply) render as
-// a styled quote block, the rest stays plain text.
-function UserText({ text }: { text: string }) {
-  const lines = text.split("\n");
-  const quote: string[] = [];
-  let i = 0;
-  while (i < lines.length && lines[i].startsWith("> ")) {
-    quote.push(lines[i].slice(2));
-    i++;
-  }
-  while (i < lines.length && lines[i].trim() === "") i++;
-  const rest = lines.slice(i).join("\n");
-  if (quote.length === 0) return <p className="whitespace-pre-wrap m-0">{text}</p>;
-  const flat = quote.join("\n");
-  return (
-    <>
-      <div className="rounded-lg bg-black/15 border-l-2 border-white/60 pl-2.5 pr-2 py-1 mb-1.5 text-[13px] leading-snug opacity-90 whitespace-pre-wrap">
-        {flat.slice(0, 300)}
-        {flat.length > 300 ? "…" : ""}
-      </div>
-      {rest && <p className="whitespace-pre-wrap m-0">{rest}</p>}
-    </>
-  );
-}
+import { ModulePickList, SUGGESTIONS, UserText } from "../components/tutorPieces";
 
 export default function Tutor() {
   const navigate = useNavigate();
@@ -79,6 +51,8 @@ export default function Tutor() {
     setActiveConversationId,
     proficiency,
     topicsByModule,
+    courses,
+    allCourseTrees,
   } = useStore();
   const {
     conversations,
@@ -93,8 +67,11 @@ export default function Tutor() {
     timer,
     stopTimer,
     todo,
+    activePin,
+    startPinned,
   } = useChatThread();
-
+  const [pinMenuOpen, setPinMenuOpen] = useState(false);
+  const [newMenuOpen, setNewMenuOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [prefsOpen, setPrefsOpen] = useState(false);
   const [instructions, setInstructions] = useState("");
@@ -292,7 +269,7 @@ export default function Tutor() {
       return;
     }
     if (cmd === "/new") {
-      setActiveConversationId(null);
+      startPinned(null);
       notifySuccess("Started a new chat.");
       return;
     }
@@ -362,6 +339,24 @@ export default function Tutor() {
     });
   }
 
+  // Re-pin the active thread (PATCH, no chat noise) or set the pending pin
+  // for a brand-new conversation.
+  async function repin(mod: { id: number; name: string } | null) {
+    setPinMenuOpen(false);
+    setNewMenuOpen(false);
+    if (activeConversationId == null) {
+      startPinned(mod);
+      return;
+    }
+    try {
+      await pinConversation(activeConversationId, mod?.id ?? null);
+      await refreshList();
+      notifySuccess(mod ? `Pinned to ${mod.name}.` : "Unpinned.");
+    } catch (e) {
+      notifyError((e as Error).message);
+    }
+  }
+
   return (
     <div className="flex gap-4 items-start animate-fadeIn h-[calc(100vh-3.5rem)]">
       {/* Main thread */}
@@ -371,6 +366,26 @@ export default function Tutor() {
           <h1 className="text-sm font-semibold text-foreground truncate">
             {activeTitle ?? "New conversation"}
           </h1>
+          {/* Module pin chip: stored pin on threads, pending pin on new chats */}
+          <div className="relative shrink-0">
+            <button
+              onClick={() => setPinMenuOpen((o) => !o)}
+              title={activePin ? `Pinned to ${activePin.name}` : "Unpinned chat"}
+              className={`flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border font-semibold max-w-48 ${
+                activePin
+                  ? "bg-accent/10 text-accent border-accent/30"
+                  : "bg-muted/50 text-muted-foreground border-border/70"
+              }`}
+            >
+              {activePin ? <Pin size={12} /> : <PinOff size={12} />}
+              <span className="truncate">{activePin?.name ?? "Unpinned"}</span>
+            </button>
+            {pinMenuOpen && (
+              <div className="absolute z-30 mt-1.5 left-0 w-64 rounded-xl bg-card border border-border shadow-lg p-1.5 space-y-0.5 max-h-72 overflow-y-auto">
+                <ModulePickList courses={courses} allCourseTrees={allCourseTrees} onPick={repin} />
+              </div>
+            )}
+          </div>
           {timer && (
             <div
               title={timer.label}
@@ -483,7 +498,21 @@ export default function Tutor() {
                 }`}
               >
                 {m.role === "user" ? (
-                  <UserText text={m.content} />
+                  <>
+                    {m.content && <UserText text={m.content} />}
+                    {m.images?.map((image, index) => (
+                      <figure key={`${m.id}-${index}`} className={m.content ? "mt-3" : ""}>
+                        <img
+                          src={image}
+                          alt={`Attached image ${index + 1}`}
+                          className="block max-h-96 max-w-full rounded-xl border border-white/30 bg-black/10 object-contain shadow-sm"
+                        />
+                        <figcaption className="mt-1 text-[10px] font-medium text-white/75">
+                          Attached image
+                        </figcaption>
+                      </figure>
+                    ))}
+                  </>
                 ) : (
                   <Markdown text={m.content} />
                 )}
@@ -539,10 +568,19 @@ export default function Tutor() {
           )}
           {busy && !streamText && (
             <div className="flex justify-start">
-              <div className="rounded-2xl rounded-bl-md px-4 py-2.5 bg-muted/60 border border-border/60 text-sm text-muted-foreground">
-                {liveTools.length > 0
-                  ? `Using ${liveTools.map((t) => t.tool).join(", ")}…`
-                  : "Thinking…"}
+              <div className="rounded-2xl rounded-bl-md px-3 py-2.5 bg-muted/60 border border-border/60 text-sm text-muted-foreground min-w-40">
+                {liveTools.length > 0 ? (
+                  <ToolActivity names={[...new Set(liveTools.map((t) => t.tool))]} />
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <span className="flex gap-1" aria-hidden="true">
+                      <span className="h-1.5 w-1.5 rounded-full bg-accent/70 animate-pulse" />
+                      <span className="h-1.5 w-1.5 rounded-full bg-accent/50 animate-pulse [animation-delay:150ms]" />
+                      <span className="h-1.5 w-1.5 rounded-full bg-accent/30 animate-pulse [animation-delay:300ms]" />
+                    </span>
+                    Thinking…
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -648,6 +686,14 @@ export default function Tutor() {
                 >
                   <div className="flex items-center gap-1.5">
                     <span className="flex-1 truncate">{c.title}</span>
+                    {c.module_name && (
+                      <span
+                        title={`Pinned to ${c.module_name}`}
+                        className="shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-accent/15 text-accent border border-accent/30 truncate max-w-28"
+                      >
+                        {c.module_name}
+                      </span>
+                    )}
                     <button
                       title="Delete"
                       onClick={(e) => {
@@ -668,12 +714,19 @@ export default function Tutor() {
               )}
             </div>
 
-            <button
-              onClick={() => setActiveConversationId(null)}
-              className="btn text-xs py-2 w-full"
-            >
-              <Plus size={13} /> New chat
-            </button>
+            <div className="relative">
+              <button
+                onClick={() => setNewMenuOpen((o) => !o)}
+                className="btn text-xs py-2 w-full"
+              >
+                <Plus size={13} /> New chat
+              </button>
+              {newMenuOpen && (
+                <div className="absolute z-30 mb-1.5 bottom-full left-0 w-full rounded-xl bg-card border border-border shadow-lg p-1.5 space-y-0.5 max-h-72 overflow-y-auto">
+                  <ModulePickList courses={courses} allCourseTrees={allCourseTrees} onPick={repin} />
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}

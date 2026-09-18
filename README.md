@@ -41,7 +41,7 @@ all in a local SQLite database.
 cp config.toml myconfig.toml   # optional; edit [llm] base_url + model
 export KB_CONFIG="$PWD/myconfig.toml"
 
-# 2. Install + run everything (backend :8000, frontend :5173)
+# 2. Build + run the local production app (:8000)
 ./run.sh
 ```
 
@@ -49,11 +49,12 @@ Or run the pieces separately:
 
 ```bash
 uv sync
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000   # creates + migrates knowledge_base.db
+uv run uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000
 cd frontend && npm install && npm run dev
 ```
 
-Frontend production build: `cd frontend && npm run build` (must pass `tsc` clean).
+`./run.sh` builds `frontend/dist` and FastAPI serves it with the API on port
+8000. For frontend development only, run `npm run dev` separately on :5173.
 
 ### LLM configuration
 

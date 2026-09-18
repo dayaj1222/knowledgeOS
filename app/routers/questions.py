@@ -65,6 +65,8 @@ def generate_quiz(payload: schemas.QuizGenerateRequest, db: Session = Depends(ge
 # ---- Assessments ----
 @router.post("/assessments", status_code=201)
 def create_assessment(payload: schemas.AssessmentCreate, db: Session = Depends(get_db)):
+    if not db.get(models.User, payload.user_id):
+        raise HTTPException(404, "User not found")
     a = models.Assessment(**payload.model_dump())
     db.add(a)
     db.commit()
@@ -132,6 +134,20 @@ def delete_assessment(assessment_id: int, db: Session = Depends(get_db)):
 # ---- Attempts ----
 @router.post("/attempts", status_code=201)
 def create_attempt(payload: schemas.AttemptCreate, db: Session = Depends(get_db)):
+    assessment = db.get(models.Assessment, payload.assessment_id)
+    if assessment is None or assessment.user_id != payload.user_id:
+        raise HTTPException(404, "Assessment not found")
+    question = db.get(models.Question, payload.question_id)
+    if question is None:
+        raise HTTPException(404, "Question not found")
+    linked = db.scalar(
+        select(models.AssessmentQuestion.id).where(
+            models.AssessmentQuestion.assessment_id == assessment.id,
+            models.AssessmentQuestion.question_id == question.id,
+        )
+    )
+    if linked is None:
+        raise HTTPException(422, "Question is not part of this assessment")
     attempt = models.Attempt(**payload.model_dump())
     db.add(attempt)
     db.commit()

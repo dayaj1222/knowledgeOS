@@ -18,7 +18,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-CHUNK_TOKENS = 800
+from ..config import settings
+
+CHUNK_TOKENS = settings.ingest.chunk_tokens  # cap; structure decides cuts
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 _FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
@@ -37,18 +39,27 @@ def _approx_tokens(text: str) -> int:
 def strip_boilerplate(markdown: str, min_repeats: int = 3) -> tuple[str, list[str]]:
     """Drop exact-repeat lines (running heads/feet) outside code/tables.
 
-    Headings (#), table rows, and fenced code are never boilerplate — a
-    repeated slide title is content, not chrome. Returns (clean, stripped)
-    where stripped is the sorted report of removed lines.
+    Headings (#), table rows, fenced code, and <image-text> figure blocks
+    are never boilerplate — a repeated slide title is content, not chrome,
+    and figure open/close tags repeat by construction (stripping the
+    shared </image-text> line once merged 13 figures into one chunk).
+    Returns (clean, stripped) where stripped is the sorted report.
     """
     lines = [line.rstrip() for line in markdown.split("\n")]
     masked = [False] * len(lines)
     in_fence = False
+    in_figure = False
     for i, line in enumerate(lines):
         if _FENCE_RE.match(line):
             in_fence = not in_fence
             masked[i] = True
-        elif in_fence or _TABLE_ROW_RE.match(line) or _HEADING_RE.match(line):
+        elif _IMAGE_OPEN_RE.match(line):
+            in_figure = True
+            masked[i] = True
+        elif _IMAGE_CLOSE_RE.match(line):
+            in_figure = False
+            masked[i] = True
+        elif in_fence or in_figure or _TABLE_ROW_RE.match(line) or _HEADING_RE.match(line):
             masked[i] = True
 
     counts: dict[str, int] = {}

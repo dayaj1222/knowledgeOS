@@ -41,4 +41,4 @@ def fail(error_type: str, detail: str, *, status_code: int = 500) -> JSONRespons
 
 # Terminal states for an async resource operation. The client polls until it
 # sees one of these, then stops.
-TERMINAL_STATUSES = {"done", "failed", "partial"}
+TERMINAL_STATUSES = {"done", "failed", "partial", "cancelled"}

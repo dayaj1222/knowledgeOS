@@ -7,7 +7,7 @@ Clean split from tutor_tools.py on purpose:
 - tutor_tools.py owns the TOOL REGISTRY (signatures, descriptions, dispatch).
   It imports thin wrappers from here and registers them in TOOLS.
 
-Both tools are read-only → no confirmation step, same as search_knowledge.
+Both tools are read-only → no confirmation step, same as search_module.
 """
 
 from __future__ import annotations
@@ -260,6 +260,7 @@ def search_videos(query: str, count: int = 3) -> dict:
 # trusting the title.
 
 TRANSCRIPT_MAX_CHARS = 6000
+TRANSCRIPT_MAX_SEGMENTS = 400
 
 _STOPWORDS = frozenset(
     "the a an and or of to in on for with is are was were be been by as at "
@@ -296,7 +297,7 @@ def _keywords(text: str) -> set[str]:
 
 
 def fetch_transcript(video_id: str, max_chars: int = TRANSCRIPT_MAX_CHARS) -> dict:
-    """Pull a video's caption track as plain text (stolen pattern: v1.x fetch).
+    """Pull a video's caption track as text plus timestamped segments.
 
     Returns {"video_id", "language", "full_text"} truncated to max_chars, or
     {"video_id", "error"}. Never raises — failures degrade to unverified.
@@ -309,18 +310,58 @@ def fetch_transcript(video_id: str, max_chars: int = TRANSCRIPT_MAX_CHARS) -> di
     except ImportError:
         return {"video_id": video_id, "error": "youtube-transcript-api not installed"}
     try:
-        result = YouTubeTranscriptApi().fetch(video_id)
+        api = YouTubeTranscriptApi()
+        # `fetch(video_id)` defaults to English-only in youtube-transcript-api
+        # 1.x. Many educational videos expose only another language or an
+        # auto-generated track, so inspect the track list before fetching.
+        try:
+            tracks = list(api.list(video_id))
+        except Exception:
+            tracks = []
+        if tracks:
+            tracks.sort(key=lambda track: (
+                str(getattr(track, "language_code", "")).lower().startswith("en"),
+                not bool(getattr(track, "is_generated", True)),
+            ), reverse=True)
+            result = tracks[0].fetch()
+        else:
+            # Preserve a direct fetch fallback for older package versions and
+            # providers that expose fetch but not transcript listing.
+            result = api.fetch(video_id)
         segs = list(result)
         language = getattr(result, "language_code", None) or getattr(result, "language", None) or ""
     except Exception as e:  # noqa: BLE001 — disabled/private/no-captions → unverified
         return {"video_id": video_id, "error": f"{type(e).__name__}: {e}"[:300]}
-    full = " ".join(getattr(s, "text", "") for s in segs)
-    full = _WS_RE.sub(" ", full).strip()
+    limit = max(1000, min(int(max_chars or TRANSCRIPT_MAX_CHARS), 12000))
+    segments: list[dict] = []
+    parts: list[str] = []
+    chars = 0
+    for segment in segs:
+        text = _WS_RE.sub(" ", str(getattr(segment, "text", ""))).strip()
+        if not text:
+            continue
+        if len(segments) >= TRANSCRIPT_MAX_SEGMENTS:
+            break
+        # youtube-transcript-api exposes seconds as ``start``. Older/mock
+        # transcript objects may not, in which case preserve their order and
+        # treat them as the video's opening captions.
+        try:
+            start = max(0.0, float(getattr(segment, "start", 0.0)))
+        except (TypeError, ValueError):
+            start = 0.0
+        segments.append({"start": start, "text": text})
+        # Keep the transcript used for verification bounded, but retain a
+        # larger timestamp map so a match near a video's end can still seek.
+        if chars < limit:
+            clipped = text[:limit - chars].strip()
+            if clipped:
+                parts.append(clipped)
+                chars += len(clipped) + 1
+    full = " ".join(parts).strip()
     if not full:
         return {"video_id": video_id, "error": "empty transcript"}
-    limit = max(1000, min(int(max_chars or TRANSCRIPT_MAX_CHARS), 12000))
     return {"video_id": video_id, "language": language, "full_text": full[:limit],
-            "truncated": len(full) > limit}
+            "segments": segments, "truncated": len(segs) > len(segments)}
 
 
 def score_relevance(transcript: str, topic_text: str, topic_name: str = "") -> dict:
@@ -341,6 +382,49 @@ def score_relevance(transcript: str, topic_text: str, topic_name: str = "") -> d
     matched = sorted(name_keys & trans_keys) + sorted((topic_keys & trans_keys) - name_keys)[:8]
     return {"relevance": round(0.6 * name_cov + 0.4 * overlap, 3),
             "matched": matched[:12]}
+
+
+def _timestamp_label(seconds: float) -> str:
+    total = max(0, int(seconds))
+    return f"{total // 60}:{total % 60:02d}"
+
+
+def select_transcript_moment(segments: list[dict], query: str, topic_text: str = "") -> dict | None:
+    """Find the caption-window that best answers a video's search query.
+
+    This is deliberately deterministic rather than another model call: the
+    same evidence that verifies a video chooses its seek point, with no new
+    tool arguments or prompt instructions needed.
+    """
+    wanted = _keywords(query)
+    fallback = _keywords(topic_text)
+    if not segments or not (wanted or fallback):
+        return None
+    best: tuple[float, int, str] | None = None
+    for index, segment in enumerate(segments):
+        window = segments[index:index + 3]
+        caption = str(segment.get("text", "")).strip()
+        keys = _keywords(caption)
+        if not keys:
+            continue
+        query_score = len(keys & wanted) / len(wanted) if wanted else 0.0
+        topic_score = len(keys & fallback) / len(fallback) if fallback else 0.0
+        score = 0.8 * query_score + 0.2 * topic_score
+        if best is None or score > best[0]:
+            excerpt = " ".join(str(part.get("text", "")) for part in window).strip()
+            best = (score, index, excerpt)
+    if best is None or best[0] == 0:
+        return None
+    _, index, excerpt = best
+    try:
+        start = max(0, int(float(segments[index].get("start", 0))))
+    except (TypeError, ValueError):
+        start = 0
+    return {
+        "start_seconds": start,
+        "timestamp_label": _timestamp_label(start),
+        "timestamp_excerpt": excerpt[:220],
+    }
 
 
 # ---------- fetch ("curl a url") ----------

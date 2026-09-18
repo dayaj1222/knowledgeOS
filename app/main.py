@@ -6,16 +6,35 @@ Serve with uvicorn's factory flag:
     uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000
 """
 
+import logging
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .database import init_db
 from .errors import register_error_handlers
 from .routers import chat, courses, questions, resources, schedule, topics
 
 
+class SPAStaticFiles(StaticFiles):
+    """Serve a built Vite app, falling back to its client-side router."""
+
+    async def get_response(self, path: str, scope):  # type: ignore[no-untyped-def]
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            return await super().get_response("index.html", scope)
+
+
 def create_app() -> FastAPI:
+    logging.basicConfig(level=logging.INFO)  # pipeline logs (extract/embed/images)
     init_db()
+    resources.resume_pending_extractions()
 
     app = FastAPI()
 
@@ -42,5 +61,12 @@ def create_app() -> FastAPI:
     @app.get("/health")
     def health():
         return {"status": "ok"}
+
+    # `run.sh` builds the frontend and serves this directory from the same
+    # local origin as the API. Keeping the mount optional preserves backend
+    # development and test startup before `frontend/dist` exists.
+    frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+    if frontend_dist.is_dir():
+        app.mount("/", SPAStaticFiles(directory=frontend_dist, html=True), name="frontend")
 
     return app

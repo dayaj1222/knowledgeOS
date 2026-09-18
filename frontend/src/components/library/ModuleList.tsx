@@ -1,5 +1,5 @@
 // Left pane of the two-pane tree: selectable module list.
-import { Layers, ChevronRight } from "lucide-react";
+import { Layers, ChevronRight, MessageCircle } from "lucide-react";
 import type { Module, Topic } from "../../api";
 
 export function ModuleList({
@@ -7,11 +7,13 @@ export function ModuleList({
   topicsByModule,
   selectedModuleId,
   onSelect,
+  onStartChat,
 }: {
   modules: Module[];
   topicsByModule: Record<number, Topic[]>;
   selectedModuleId: number | null;
   onSelect: (id: number) => void;
+  onStartChat?: (m: { id: number; name: string }) => void;
 }) {
   if (modules.length === 0) return null;
 
@@ -45,6 +47,19 @@ export function ModuleList({
               </div>
 
               <div className="flex items-center gap-1.5 flex-shrink-0">
+                {onStartChat && (
+                  <button
+                    type="button"
+                    title={`Start a pinned chat about ${m.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onStartChat({ id: m.id, name: m.name });
+                    }}
+                    className="flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-semibold text-accent bg-accent/10 border border-accent/30 hover:bg-accent/20 cursor-pointer whitespace-nowrap"
+                  >
+                    <MessageCircle size={11} /> Chat
+                  </button>
+                )}
                 <span
                   className={`text-[10px] font-mono px-1.5 py-0.5 rounded-full ${
                     active

@@ -23,6 +23,7 @@ storage/*.db
 *.db
 *.sqlite
 *.sqlite3
+*.ses
 
 # Node / frontend
 node_modules/

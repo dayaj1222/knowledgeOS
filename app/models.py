@@ -21,6 +21,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    LargeBinary,
     String,
     Text,
     Time,
@@ -164,6 +165,24 @@ class Resource(Base, TimestampMixin):
     passages: Mapped[list[Passage]] = relationship(back_populates="resource")
 
 
+class ExtractionJob(Base, TimestampMixin):
+    """Durable local work queue entry for resource extraction."""
+
+    __tablename__ = "extraction_jobs"
+    __table_args__ = (UniqueConstraint("resource_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    resource_id: Mapped[int] = mapped_column(ForeignKey("resources.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="queued")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
 class Passage(Base):
     __tablename__ = "passages"
 
@@ -188,6 +207,28 @@ class Passage(Base):
     notes: Mapped[list[PassageNote]] = relationship(
         back_populates="passage", cascade="all, delete-orphan"
     )
+    embedding: Mapped[PassageEmbedding | None] = relationship(
+        back_populates="passage", cascade="all, delete-orphan", uselist=False
+    )
+
+
+class PassageEmbedding(Base):
+    """One vector per passage (float32 bytes, 384-dim bge-small).
+
+    Written at upload time; `model` versions the vector space so a future
+    model swap never silently mixes spaces. Retrieval filters by module
+    pool, ranks by cosine — passages stay unfiled under topics.
+    """
+
+    __tablename__ = "passage_embeddings"
+
+    passage_id: Mapped[int] = mapped_column(
+        ForeignKey("passages.id"), primary_key=True
+    )
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    vec: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+    passage: Mapped[Passage] = relationship(back_populates="embedding")
 
 
 class PassageNote(Base):
@@ -462,9 +503,18 @@ class Conversation(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     title: Mapped[str] = mapped_column(String(255), default="Tutor chat")
+    # Permanent module pin (None = unpinned free-form chat). Set at creation
+    # from ui_context, changed only via set_context on the learner's words —
+    # the tutor can never move or drop it on its own.
+    module_id: Mapped[int | None] = mapped_column(ForeignKey("modules.id"), nullable=True)
 
     messages: Mapped[list[ChatMessage]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan"
+    )
+    cards: Mapped[list[Card]] = relationship(
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        foreign_keys="Card.conversation_id",
     )
 
 
@@ -479,6 +529,10 @@ class ChatMessage(Base):
     )
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Original data URLs for user-attached images. Kept separately from the
+    # text transcript so history can render the attachment without feeding
+    # old images back to the model on every later turn.
+    images: Mapped[list[str] | None] = mapped_column(JSON)
     tool_calls: Mapped[list | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
@@ -509,6 +563,9 @@ class Card(Base):
     message_id: Mapped[int | None] = mapped_column(
         ForeignKey("chat_messages.id"), nullable=True
     )  # assistant message this card follows (display anchor)
+    conversation: Mapped[Conversation] = relationship(
+        back_populates="cards", foreign_keys=[conversation_id]
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
     )

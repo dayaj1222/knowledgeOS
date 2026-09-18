@@ -4,7 +4,6 @@ import {
   BookOpen,
   CalendarDays,
   Settings,
-  GraduationCap,
   Bot,
   PanelLeftClose,
   PanelLeftOpen,
@@ -32,7 +31,7 @@ export default function Sidebar() {
       <div className="fixed-width-col">
         <div className="sidebar-brand">
           <div className="sidebar-brand-icon">
-            <GraduationCap size={20} strokeWidth={2.4} />
+            <img src="/favicon.svg" alt="KnowledgeOS" width={22} height={22} />
           </div>
           <div className="sidebar-brand-text">
             <span className="font-bold text-base leading-tight tracking-tight text-foreground flex items-center gap-1.5">

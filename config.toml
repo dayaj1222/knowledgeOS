@@ -11,8 +11,11 @@ model = "EXPERT"
 tag_batch_size = 5
 # Send tagging batches sequentially (safer, respects the proxy rate gate).
 tag_parallel = false
+# High-risk local-machine tools are disabled unless explicitly enabled.
+# enable_admin_tools = true       # raw read/write SQL from the tutor
+# enable_code_execution = true    # arbitrary Python subprocesses
 
 [ingest]
-chunk_tokens = 800
+chunk_tokens = 200
 overlap_tokens = 100
 max_upload_mb = 50

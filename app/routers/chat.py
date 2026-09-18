@@ -4,7 +4,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import OperationalError, PendingRollbackError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
@@ -28,7 +28,8 @@ def chat(body: schemas.ChatRequest, db: Session = Depends(get_db)):
     for attempt in range(3):
         try:
             result = run_tutor_turn(
-                db, body.user_id, body.conversation_id, body.message, body.ui_context
+                db, body.user_id, body.conversation_id, body.message, body.ui_context,
+                (body.images or [])[:1],
             )
             return ok(result)
         except ValueError as e:
@@ -60,7 +61,8 @@ async def chat_stream(body: schemas.ChatRequest):
     async def gen():
         try:
             async for event in stream_tutor_turn(
-                db, body.user_id, body.conversation_id, body.message, body.ui_context
+                db, body.user_id, body.conversation_id, body.message, body.ui_context,
+                (body.images or [])[:1],
             ):
                 yield {"event": event["type"], "data": _json.dumps(event)}
         except ValueError as e:
@@ -141,7 +143,7 @@ def clear_conversations(user_id: int, db: Session = Depends(get_db)):
     ).all()
     n = len(convs)
     for c in convs:
-        db.delete(c)
+        _delete_conversation_rows(db, c)
     db.commit()
     return ok({"deleted": n})
 
@@ -154,7 +156,16 @@ def list_conversations(user_id: int, db: Session = Depends(get_db)):
         .order_by(models.Conversation.id.desc())
         .limit(30)
     ).all()
-    return ok([{"id": c.id, "title": c.title} for c in convs])
+    mod_names = {}
+    mids = {c.module_id for c in convs if c.module_id is not None}
+    if mids:
+        for m in db.scalars(select(models.Module).where(models.Module.id.in_(mids))).all():
+            mod_names[m.id] = m.name
+    return ok([
+        {"id": c.id, "title": c.title, "module_id": c.module_id,
+         "module_name": mod_names.get(c.module_id)}
+        for c in convs
+    ])
 
 
 @router.get("/conversations/{conversation_id}/messages")
@@ -182,6 +193,7 @@ def conversation_messages(conversation_id: int, db: Session = Depends(get_db)):
                 "id": m.id,
                 "role": m.role,
                 "content": m.content,
+                "images": m.images,
                 "tool_calls": m.tool_calls,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
             }
@@ -205,14 +217,55 @@ def conversation_messages(conversation_id: int, db: Session = Depends(get_db)):
     return ok(out)
 
 
+def _delete_conversation_rows(db, conv) -> None:
+    """Delete a thread in FK-safe order: cards, then messages, then the row.
+
+    Cards anchor to messages via message_id, so they must go first even
+    though the Conversation.cards/messages ORM cascades exist.
+    """
+    db.execute(
+        delete(models.Card).where(models.Card.conversation_id == conv.id)
+    )
+    db.execute(
+        delete(models.ChatMessage).where(
+            models.ChatMessage.conversation_id == conv.id
+        )
+    )
+    db.delete(conv)
+
+
 @router.delete("/conversations/{conversation_id}")
 def delete_conversation(conversation_id: int, db: Session = Depends(get_db)):
     conv = db.get(models.Conversation, conversation_id)
     if conv is None:
         raise HTTPException(404, "Conversation not found")
-    db.delete(conv)
+    _delete_conversation_rows(db, conv)
     db.commit()
     return ok({"deleted": True, "id": conversation_id})
+
+
+class _Pin(BaseModel):
+    module_id: int | None
+
+
+@router.patch("/conversations/{conversation_id}/pin")
+def pin_conversation(
+    conversation_id: int, body: _Pin, db: Session = Depends(get_db)
+):
+    """Direct pin/re-pin/unpin (user action — header chip, Library entry).
+    Same validation as the set_context tool; the tutor itself uses the tool."""
+    from ..agent.tutor_tools import _resolve_pin
+
+    conv = db.get(models.Conversation, conversation_id)
+    if conv is None:
+        raise HTTPException(404, "Conversation not found")
+    module = _resolve_pin(db, conv.user_id, body.module_id)
+    if isinstance(module, dict):
+        raise HTTPException(400, module.get("error", "invalid module"))
+    conv.module_id = module.id if module is not None else None
+    db.commit()
+    return ok({"id": conv.id, "module_id": conv.module_id,
+               "module_name": module.name if module is not None else None})
 
 
 class _Rename(BaseModel):

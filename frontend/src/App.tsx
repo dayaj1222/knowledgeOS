@@ -43,7 +43,8 @@ export default function App() {
         </BrowserRouter>
         <Toaster />
       </NotificationProvider>
-    </DataProvider>
-  </ThemeProvider>
+      </DataProvider>
+      </QueryClientProvider>
+    </ThemeProvider>
   );
 }

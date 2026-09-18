@@ -12,8 +12,13 @@ dependencies = [
     "email-validator>=2.0.0",
     "python-multipart>=0.0.32",
     "httpx>=0.28.1",
+    "fastembed>=0.3",
+    "numpy>=1.26",
     "pydantic-ai>=2.40.0",
     "youtube-transcript-api>=1.2.4",
+    "langgraph>=1.0",
+    "alembic>=1.18",
+    "sse-starlette>=3.0",
 ]
 
 [tool.uv.build-backend]

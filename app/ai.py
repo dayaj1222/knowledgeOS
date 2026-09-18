@@ -16,8 +16,13 @@ import os
 
 import httpx
 
-LLM_BASE_URL = os.environ.get("KB_LLM_BASE_URL", "http://127.0.0.1:9173/v1")
-LLM_MODEL = os.environ.get("KB_LLM_MODEL", "EXPERT")
+from .config import settings
+
+# Settings centralizes config.toml plus KB_* overrides.  Keeping a separate
+# os.environ-only path here meant the documented config.toml values were
+# silently ignored by every chat request.
+LLM_BASE_URL = settings.llm.base_url
+LLM_MODEL = settings.llm.model
 LLM_API_KEY = os.environ.get("KB_LLM_API_KEY", "")
 _HTTP_TIMEOUT = 300.0  # local model can be slow
 
@@ -44,6 +49,23 @@ def _threading_allowed() -> bool:
 
 def _use_thread(thread_id: str | None) -> str | None:
     return thread_id if (thread_id and _THREAD_OK and _threading_allowed()) else None
+
+
+def _has_image_parts(messages: list[dict]) -> bool:
+    """Whether a chat request contains OpenAI multimodal content.
+
+    Some OpenAI-compatible proxies accept image content for regular
+    completions but silently drop it on their streaming path.  Keep this
+    check at the transport boundary so every caller gets the safe behavior.
+    """
+    return any(
+        isinstance(message.get("content"), list)
+        and any(
+            isinstance(part, dict) and part.get("type") == "image_url"
+            for part in message["content"]
+        )
+        for message in messages
+    )
 
 
 async def _chat(messages: list[dict], temperature: float = 0.2) -> str:
@@ -112,6 +134,24 @@ async def chat_stream(messages: list[dict], tools: list[dict] | None = None,
     attached when the endpoint is known-good (_THREAD_OK from a prior
     non-stream call, or the threading allowlist).
     """
+    # The local proxy's streaming endpoint is text-oriented: it can return a
+    # successful stream while discarding image_url parts. Use the regular
+    # completion endpoint for multimodal turns and preserve this function's
+    # event contract for the graph/SSE caller.
+    if _has_image_parts(messages):
+        msg = await chat_with_tools(
+            messages, tools=tools, temperature=0.4,
+            tool_choice="auto", thread_id=thread_id,
+        )
+        content = str(msg.get("content") or "")
+        if content:
+            yield ("token", content)
+        yield ("done", {
+            "content": content,
+            "tool_calls": msg.get("tool_calls") or [],
+        })
+        return
+
     payload: dict = {
         "model": LLM_MODEL,
         "messages": messages,

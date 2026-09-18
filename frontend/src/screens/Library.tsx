@@ -1,12 +1,12 @@
 // Library — minimalist three-column layout.
-//   Courses | Modules + Topics | Uploads + Materials (expandable passages)
+//   Courses | Modules + Topics | Uploads + Materials (chunk counts per file)
 
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   Plus,
   FileText,
   ChevronRight,
-  ChevronDown,
   FolderOpen,
   BookOpen,
   BookMarked,
@@ -23,9 +23,9 @@ import { ModuleList } from "../components/library/ModuleList";
 import { TopicList } from "../components/library/TopicList";
 import { MultiUploader } from "../components/library/MultiUploader";
 import { AddButton } from "../components/library/AddButton";
-import { PassageViewer } from "../components/library/PassageViewer";
 
 export default function Library() {
+  const navigate = useNavigate();
   const {
     modules,
     topicsByModule,
@@ -41,7 +41,6 @@ export default function Library() {
   } = useStore();
   const selectedCourse = useSelectedCourse();
   const [selectedModuleId, setSelectedModuleId] = useState<number | null>(null);
-  const [openResourceId, setOpenResourceId] = useState<number | null>(null);
 
   const activeModuleId = selectedModuleId ?? modules[0]?.id ?? null;
   const activeModule = activeModuleId != null ? modules.find((m) => m.id === activeModuleId) : null;
@@ -52,11 +51,6 @@ export default function Library() {
 
   const moduleNameById: Record<number, string> = {};
   for (const m of modules) moduleNameById[m.id] = m.name;
-
-  const topicNameById: Record<number, string> = {};
-  for (const list of Object.values(topicsByModule)) {
-    for (const t of list) topicNameById[t.id] = t.name;
-  }
 
   return (
     <div className="space-y-5 animate-fadeIn max-w-6xl">
@@ -122,6 +116,7 @@ export default function Library() {
                       topicsByModule={topicsByModule}
                       selectedModuleId={activeModuleId}
                       onSelect={setSelectedModuleId}
+                      onStartChat={(m) => navigate("/", { state: { pinModule: m } })}
                     />
                   )}
                   <AddButton
@@ -196,43 +191,33 @@ export default function Library() {
                   Files ({resources.length})
                 </h3>
                 <div className="space-y-1.5 max-h-72 overflow-y-auto pr-0.5">
-                  {resources.map((r) => {
-                    const open = openResourceId === r.id;
-                    return (
-                      <div
-                        key={r.id}
-                        className="rounded-lg bg-muted/50 border border-border/70 text-xs overflow-hidden"
-                      >
-                        <button
-                          onClick={() => setOpenResourceId(open ? null : r.id)}
-                          className="w-full flex items-center gap-2 p-2 text-left cursor-pointer"
-                        >
-                          {open ? (
-                            <ChevronDown size={13} className="text-accent shrink-0" />
-                          ) : (
-                            <ChevronRight size={13} className="text-muted-foreground shrink-0" />
-                          )}
-                          <FileText size={13} className="text-accent shrink-0" />
-                          <span className="flex-1 min-w-0 font-medium text-foreground truncate" title={r.name}>
-                            {r.name}
-                          </span>
-                          <span className="text-[10px] font-mono uppercase font-bold text-muted-foreground shrink-0">
-                            {r.status ?? r.type}
-                          </span>
-                        </button>
-                        {open && (
-                          <div className="px-2 pb-2">
-                            <PassageViewer resourceId={r.id} topicNameById={topicNameById} />
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
+                  {resources.map((r) => (
+                    <div
+                      key={r.id}
+                      className="rounded-lg bg-muted/50 border border-border/70 text-xs flex items-center gap-2 p-2"
+                    >
+                      <FileText size={13} className="text-accent shrink-0" />
+                      <span className="flex-1 min-w-0 font-medium text-foreground truncate" title={r.name}>
+                        {r.name}
+                      </span>
+                      {r.module_id != null && moduleNameById[r.module_id] && (
+                        <span className="text-[10px] text-muted-foreground truncate max-w-28 shrink-0" title={moduleNameById[r.module_id]}>
+                          {moduleNameById[r.module_id]}
+                        </span>
+                      )}
+                      <span className="text-[10px] font-mono text-muted-foreground shrink-0">
+                        {r.passage_count ?? 0} chunks
+                      </span>
+                      <span className="text-[10px] font-mono uppercase font-bold text-muted-foreground shrink-0">
+                        {r.status ?? r.type}
+                      </span>
+                    </div>
+                  ))}
                 </div>
 
                 {resources.length === 0 && (
                   <p className="text-xs text-muted-foreground text-center py-2">
-                    No files yet. Upload above to extract passages.
+                    No files yet. Upload above to build the module's knowledge pool.
                   </p>
                 )}
               </div>

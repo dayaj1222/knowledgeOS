@@ -5,6 +5,7 @@ ScheduleService, study logging in StudyService.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -203,3 +204,33 @@ def submit_review_result(payload: schemas.ReviewResultCreate, db: Session = Depe
         "interval_days": review.interval_days,
         "ease_factor": review.ease_factor,
     })
+
+
+class _ReviewSessionFinish(BaseModel):
+    conversation_id: int
+    card_id: int
+
+
+@router.post("/reviews/session/finish", status_code=200)
+def finish_review_session(body: _ReviewSessionFinish, db: Session = Depends(get_db)):
+    """Stamp a finished review session so reloads render a read-only summary.
+
+    Per-card self-ratings already wrote their SM-2 results via
+    POST /reviews/result; this only flips the card state. Without it, a
+    completed session renders as a fresh "Recall 1/N" card on any client
+    without the localStorage draft — and re-rating would double-write
+    schedules. Idempotent.
+    """
+    card = db.get(models.Card, body.card_id)
+    if (
+        card is None
+        or card.conversation_id != body.conversation_id
+        or card.kind != "review"
+    ):
+        raise HTTPException(404, "Review card not found")
+    payload = dict(card.payload or {})
+    if not payload.get("completed"):
+        # JSON columns need full reassignment for change tracking.
+        card.payload = {**payload, "completed": True}
+        db.commit()
+    return ok({"finished": True, "id": card.id})

@@ -28,12 +28,25 @@ from datetime import datetime
 
 from sqlalchemy import func, select
 
+from .. import ai as _ai_module
 from .. import models
-from ..ai import chat_stream, chat_with_tools
-from ..services import ReviewService
+from ..ai import chat_stream  # noqa: F401 - graph resolves this patchable stream entry
 from . import cards as card_registry
+from .graph import open_graph_turn, run_graph_turn, stream_agent_loop
 from .prompt import QUIZ_DEBRIEF_PROMPT, TUTOR_PROMPT
-from .tutor_tools import openai_tools, run_tool
+from .tutor_tools import (  # noqa: F401 - graph context pin
+    current_conversation,
+    openai_tools,
+    run_tool,
+)
+
+
+async def chat_with_tools(messages, tools=None, temperature=0.4, tool_choice="auto", thread_id=None):
+    """Re-exported LLM entry so tests can patch tutor.chat_with_tools."""
+    return await _ai_module.chat_with_tools(
+        messages, tools=tools, temperature=temperature,
+        tool_choice=tool_choice, thread_id=thread_id,
+    )
 
 MAX_TOOL_ROUNDS = 8
 PREVIEW_LEN = 300
@@ -67,29 +80,12 @@ def _library_line(db, user_id: int) -> str:
 
 
 def build_snapshot(db, user_id: int) -> str:
-    """Short learner-state brief injected every turn (no tool calls needed)."""
-    n_courses = len(
-        db.scalars(select(models.Course).where(models.Course.user_id == user_id)).all()
-    )
-    n_topics = db.scalar(
-        select(func.count(models.Topic.id))
-        .join(models.Module, models.Topic.module_id == models.Module.id)
-        .join(models.Course, models.Module.course_id == models.Course.id)
-        .where(models.Course.user_id == user_id)
-    )
-    profs = db.scalars(
-        select(models.Proficiency)
-        .where(models.Proficiency.user_id == user_id)
-        .order_by(models.Proficiency.score)
-        .limit(3)
-    ).all()
-    weak = []
-    for r in profs:
-        topic = db.get(models.Topic, r.topic_id)
-        weak.append(f"{topic.name if topic else r.topic_id} ({r.score:.2f})")
+    """Minimal learner-state brief injected every turn.
 
-    due = ReviewService.due_queue(db, user_id, limit=5)
-    due_names = [d.get("topic_name", f"Topic #{d.get('topic_id')}") for d in due]
+    Deliberately slim: weakest topics and due reviews are fetchable via tools
+    (get_proficiency / get_due_reviews), so they don't ride along unasked.
+    Only what the tutor can't cheaply fetch stays here.
+    """
     avg = db.scalar(
         select(func.avg(models.Attempt.score)).where(
             models.Attempt.user_id == user_id,
@@ -106,9 +102,6 @@ def build_snapshot(db, user_id: int) -> str:
         select(models.TutorMemory).where(models.TutorMemory.user_id == user_id)
     ).all()
     return (
-        f"Library: {n_courses} course(s), {n_topics} topic(s) total | "
-        f"Weakest topics: {', '.join(weak) or '(no scores yet)'} | "
-        f"Reviews due: {len(due)} ({', '.join(due_names[:3]) or 'none'}) | "
         f"Recent quiz avg: {(avg or 0):.2f} | "
         f"Deadlines: {', '.join(f'{d.title} ({d.due_date})' for d in upcoming) or 'none'} | "
         f"Notes: {'; '.join(f'{m.key}: {m.value}' for m in mems) or 'none'}"
@@ -125,35 +118,13 @@ def _thread_id(user_id: int, conversation_id: int) -> str:
     return f"tutor_u{user_id}_c{conversation_id}"
 
 
-def _persona_block(pref) -> str:
-    """Compose the user's tutor controls into one system-prompt block:
-    teaching style preset + verbosity + free-text instructions. Defaults
-    inject nothing (keep the prompt lean); anything set overrides the
-    built-in TEACH-loop defaults for tone and length."""
-    if pref is None:
-        return ""
-    lines = []
-    style = (pref.tutor_style or "balanced").strip().lower()
-    if style == "socratic":
-        lines.append("Teaching style: Socratic — lead with questions, never lecture; make the student derive each step before you confirm it.")
-    elif style == "direct":
-        lines.append("Teaching style: direct — explain first, crisply and completely, then check with one question.")
-    elif style == "drill":
-        lines.append("Teaching style: exam drill — prioritize practice questions and timed recall over explanation; teach only to fix misses.")
-    verbosity = (pref.tutor_verbosity or "balanced").strip().lower()
-    if verbosity == "concise":
-        lines.append("Reply length: concise — a few sentences max per turn, no preamble, no recap unless asked.")
-    elif verbosity == "detailed":
-        lines.append("Reply length: detailed — full worked examples and thorough explanations when the topic warrants it.")
-    if pref.tutor_instructions and pref.tutor_instructions.strip():
-        lines.append(f"STUDENT'S CUSTOM INSTRUCTIONS (highest priority, follow them):\n{pref.tutor_instructions.strip()}")
-    if not lines:
-        return ""
-    return "\n\nTUTOR PERSONA (user-configured, overrides defaults):\n" + "\n".join(lines)
-
-
 def _stable_system(custom: str, library: str = "") -> str:
     """System prompt that is IDENTICAL every turn of a conversation.
+
+    `custom` is the already-rendered persona block from prompt.persona_block
+    (kept as a param so call sites don't change); the canonical assembly
+    lives in prompt.build_system_prompt — the Settings preview renders the
+    same function, so what you see there is what the model gets.
 
     Per-turn state (learner snapshot, UI state) rides on the latest user
     message instead — the proxy only forwards the system block on the
@@ -163,6 +134,19 @@ def _stable_system(custom: str, library: str = "") -> str:
     """
     base = f"{TUTOR_PROMPT}{custom}"
     return f"{base}\n\n{library}" if library else base
+
+
+def _persona_for(pref) -> str:
+    """Thin adapter: Preference row -> prompt.persona_block (single source)."""
+    from .prompt import persona_block as _pb
+
+    if pref is None:
+        return _pb(None, None, None)
+    return _pb(
+        getattr(pref, "tutor_style", None),
+        getattr(pref, "tutor_verbosity", None),
+        getattr(pref, "tutor_instructions", None),
+    )
 
 
 def _todo_line(db, conversation_id: int) -> str:
@@ -212,7 +196,7 @@ def _todo_line(db, conversation_id: int) -> str:
 
 
 def _open_turn(db, user_id: int, conversation_id: int | None, message: str,
-               ui_context: dict | None = None):
+               ui_context: dict | None = None, images: list[str] | None = None):
     """Get/create conversation, persist the user message, build the prompt.
 
     Returns (conversation_id, messages, thread_id) where messages are
@@ -223,6 +207,13 @@ def _open_turn(db, user_id: int, conversation_id: int | None, message: str,
     """
     if conversation_id is None:
         conv = models.Conversation(user_id=user_id, title=message[:60] or "Tutor chat")
+        pin = (ui_context or {}).get("module_id")
+        if pin is not None:
+            from .tutor_tools import _resolve_pin
+
+            module = _resolve_pin(db, user_id, pin)
+            if not isinstance(module, dict) and module is not None:
+                conv.module_id = module.id
         db.add(conv)
         db.commit()
         db.refresh(conv)
@@ -232,7 +223,14 @@ def _open_turn(db, user_id: int, conversation_id: int | None, message: str,
         if conv is None or conv.user_id != user_id:
             raise ValueError("Conversation not found")
 
-    db.add(models.ChatMessage(conversation_id=conversation_id, role="user", content=message))
+    # Keep the image outside the transcript: history rendering can show it,
+    # while subsequent model turns keep the text-only history compact.
+    db.add(models.ChatMessage(
+        conversation_id=conversation_id,
+        role="user",
+        content=message,
+        images=(images or [])[:1] or None,
+    ))
     db.commit()
 
     _stamp_clarify_answered(db, conversation_id, message)
@@ -252,7 +250,7 @@ def _open_turn(db, user_id: int, conversation_id: int | None, message: str,
     messages: list[dict] = []
     snapshot = build_snapshot(db, user_id)
     pref = db.get(models.Preference, user_id)
-    custom = _persona_block(pref)
+    custom = _persona_for(pref)
     library = _library_line(db, user_id)
     messages.append({"role": "system", "content": _stable_system(custom, library)})
     for m in prior[-20:]:
@@ -260,10 +258,26 @@ def _open_turn(db, user_id: int, conversation_id: int | None, message: str,
             "role": m.role,
             "content": m.content,
         })
-    context_line = f"LEARNER SNAPSHOT: {snapshot}{_ui_state_line(ui_context)}{_todo_line(db, conversation_id)}"
+    context_line = f"LEARNER SNAPSHOT: {snapshot}{_todo_line(db, conversation_id)}"
+    # Stored pin is the module truth (permanent until set_context moves it).
+    pin_id = getattr(conv, "module_id", None)
+    if pin_id is not None:
+        pin_mod = db.get(models.Module, pin_id)
+        context_line += f"\nPINNED MODULE: {pin_mod.name if pin_mod else f'#{pin_id}'} (law — never search outside it unasked)"
+    else:
+        context_line += "\nPINNED MODULE: none (unpinned — resolve per question, state the module)"
+    user_text = f"{context_line}\n\n{message}"
+    user_content: str | list[dict] = user_text
+    if images:
+        # OpenAI multipart: text first, then the turn's image. The proxy
+        # forwards the first image per turn; history stays text-only.
+        user_content = [
+            {"type": "text", "text": user_text},
+            {"type": "image_url", "image_url": {"url": images[0]}},
+        ]
     messages.append({
         "role": "user",
-        "content": f"{context_line}\n\n{message}",
+        "content": user_content,
     })
     return conversation_id, messages, _thread_id(user_id, conversation_id)
 
@@ -290,21 +304,6 @@ def _stamp_clarify_answered(db, conversation_id: int, message: str) -> None:
         card.payload = {**args, "completed": True, "answer": message[:500]}
         db.commit()
         break
-
-
-def _ui_state_line(ui_context: dict | None) -> str:
-    """Render reported frontend state for the prompt (route, course, ...)."""
-    if not ui_context:
-        return ""
-    route = ui_context.get("route", "?")
-    course = ui_context.get("course_name") or (
-        f"#{ui_context['course_id']}" if ui_context.get("course_id") else "none selected"
-    )
-    extra = ui_context.get("detail")
-    line = f"\n\nUI STATE: screen={route} | course={course}"
-    if extra:
-        line += f" | {extra}"
-    return line
 
 
 def _preview(result) -> str:
@@ -369,10 +368,9 @@ def _finalize_turn(
 
 
 def run_tutor_turn(db, user_id: int, conversation_id: int | None, message: str,
-                   ui_context: dict | None = None) -> dict:
-    """One chat turn (non-streamed): run the tool loop, persist, return reply."""
-    conversation_id, messages, thread_id = _open_turn(db, user_id, conversation_id, message, ui_context)
-    return _run_tool_loop(db, user_id, conversation_id, messages, thread_id)
+                   ui_context: dict | None = None, images: list[str] | None = None) -> dict:
+    """One LangGraph-backed chat turn; persist and return the API payload."""
+    return run_graph_turn(db, user_id, conversation_id, message, ui_context, images)
 
 
 def _parse_call(call: dict) -> tuple[str, dict]:
@@ -425,70 +423,29 @@ def _dedupe_key(name: str, args: dict) -> str:
         return f"{name}:{args}"
 
 
+def openai_tools_shim() -> list[dict]:
+    """Late-bound accessor so graph.py avoids a module-level import cycle."""
+    return openai_tools()
+
+
 def _run_tool_loop(db, user_id: int, conversation_id: int, messages: list[dict],
                    thread_id: str | None = None) -> dict:
-    tools = openai_tools()
-    tool_calls: list[dict] = []
-    ui_actions: list[dict] = []
-    cards: dict[str, dict] = {}  # kind -> raw payload (registry applies first/last-wins)
-    seen: set[str] = set()  # exact-duplicate (tool, args) calls run once per turn
-    reply = ""
-    for _ in range(MAX_TOOL_ROUNDS):
-        msg = asyncio.run(chat_with_tools(messages, tools=tools, temperature=0.4,
-                                          thread_id=thread_id))
-        calls = msg.get("tool_calls") or []
-        messages.append(
-            {
-                "role": "assistant",
-                "content": msg.get("content"),
-                "tool_calls": calls or None,
-            }
-        )
-        if not calls:
-            reply = msg.get("content") or ""
-            if not reply.strip() and not tool_calls:
-                # Empty completion — nudge once rather than saving a blank turn.
-                messages.append(
-                    {"role": "user", "content": "Please respond with text, or a tool call if one fits."}
-                )
-                continue
-            break
-        for call in calls:
-            name, args = _parse_call(call)
-            key = _dedupe_key(name, args)
-            if key in seen:
-                # Native call + proxy-translated duplicate of the same action:
-                # answer from cache instead of executing twice.
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.get("id"),
-                        "content": json.dumps({"duplicate": True, "cached": True}),
-                    }
-                )
-                continue
-            seen.add(key)
-            result, ui_action = _execute_call(db, user_id, name, args)
-            tool_calls.append({"tool": name, "args": args, "result_preview": _preview(result)})
-            hit = card_registry.capture(name, result)
-            if hit is not None:
-                kind, payload = hit
-                _, first_wins = card_registry.TRIGGERS[name]
-                if not first_wins or kind not in cards:
-                    cards[kind] = payload
-            if ui_action is not None:
-                ui_actions.append(ui_action)
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.get("id"),
-                    "content": json.dumps(result)[:4000],
-                }
-            )
-    else:
-        reply = reply or "Let me know how you'd like to proceed."
+    # Canonical loop lives in graph.run_agent_loop (LangGraph model<->tools).
+    from .graph import run_agent_loop
 
-    return _finalize_turn(db, conversation_id, reply, tool_calls, ui_actions, cards)
+    return run_agent_loop(
+        db, user_id, conversation_id, messages, thread_id, openai_tools(),
+    )
+
+
+def _run_tool_loop_inner(db, user_id: int, conversation_id: int, messages: list[dict],
+                          thread_id: str | None, tools: list[dict]) -> dict:
+    # Kept for tests/callers: same canonical loop with explicit tools.
+    from .graph import run_agent_loop
+
+    return run_agent_loop(
+        db, user_id, conversation_id, messages, thread_id, tools,
+    )
 
 
 def run_quiz_debrief(db, user_id: int, conversation_id: int, assessment_id: int) -> dict:
@@ -564,8 +521,10 @@ def run_quiz_debrief(db, user_id: int, conversation_id: int, assessment_id: int)
     snapshot = build_snapshot(db, user_id)
     library = _library_line(db, user_id)
     thread_id = _thread_id(user_id, conversation_id)
+    pref = db.get(models.Preference, user_id)
+    # Same system as a normal turn — persona included — plus the debrief task.
     messages = [
-        {"role": "system", "content": f"{TUTOR_PROMPT}\n\n{QUIZ_DEBRIEF_PROMPT}\n\n{library}"},
+        {"role": "system", "content": f"{_stable_system(_persona_for(pref), library)}\n\n{QUIZ_DEBRIEF_PROMPT}"},
     ]
     for m in prior[-20:]:
         messages.append({"role": m.role, "content": m.content})
@@ -579,72 +538,16 @@ def run_quiz_debrief(db, user_id: int, conversation_id: int, assessment_id: int)
 
 
 async def stream_tutor_turn(db, user_id: int, conversation_id: int | None, message: str,
-                          ui_context: dict | None = None):
+                          ui_context: dict | None = None, images: list[str] | None = None):
     """Streaming twin of run_tutor_turn. Yields event dicts:
     {"type": "tool", "tool", "args", "result_preview"},
     {"type": "token", "text"}, then {"type": "done", ...} (same shape as
     run_tutor_turn's return). Persists both messages like the sync version.
     """
-    conversation_id, messages, thread_id = _open_turn(db, user_id, conversation_id, message, ui_context)
-    tools = openai_tools()
-    tool_calls: list[dict] = []
-    ui_actions: list[dict] = []
-    cards: dict[str, dict] = {}  # kind -> raw payload (registry applies first/last-wins)
-    seen: set[str] = set()  # exact-duplicate (tool, args) calls run once per turn
-    reply = ""
-    for _ in range(MAX_TOOL_ROUNDS):
-        content_parts: list[str] = []
-        calls: list[dict] = []
-        async for kind, payload in chat_stream(messages, tools=tools, thread_id=thread_id):
-            if kind == "token":
-                content_parts.append(payload)
-                yield {"type": "token", "text": payload}
-            elif kind == "done":
-                reply = payload["content"]
-                calls = payload["tool_calls"]
-        messages.append(
-            {"role": "assistant", "content": reply or None, "tool_calls": calls or None}
-        )
-        if not calls:
-            if not reply.strip() and not tool_calls:
-                messages.append(
-                    {"role": "user", "content": "Please respond with text, or a tool call if one fits."}
-                )
-                continue
-            break
-        for call in calls:
-            name, args = _parse_call(call)
-            key = _dedupe_key(name, args)
-            if key in seen:
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.get("id"),
-                        "content": json.dumps({"duplicate": True, "cached": True}),
-                    }
-                )
-                continue
-            seen.add(key)
-            result, ui_action = await _aexecute_call(db, user_id, name, args)
-            preview = _preview(result)
-            tool_calls.append({"tool": name, "args": args, "result_preview": preview})
-            yield {"type": "tool", "tool": name, "args": args, "result_preview": preview}
-            hit = card_registry.capture(name, result)
-            if hit is not None:
-                kind, payload = hit
-                _, first_wins = card_registry.TRIGGERS[name]
-                if not first_wins or kind not in cards:
-                    cards[kind] = payload
-            if ui_action is not None:
-                ui_actions.append(ui_action)
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.get("id"),
-                    "content": json.dumps(result)[:4000],
-                }
-            )
-    else:
-        reply = reply or "Let me know how you'd like to proceed."
-
-    yield {"type": "done", **_finalize_turn(db, conversation_id, reply, tool_calls, ui_actions, cards)}
+    conversation_id, messages, thread_id = open_graph_turn(
+        db, user_id, conversation_id, message, ui_context, images
+    )
+    async for event in stream_agent_loop(
+        db, user_id, conversation_id, messages, thread_id, openai_tools(),
+    ):
+        yield event

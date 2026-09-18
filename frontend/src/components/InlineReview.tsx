@@ -6,11 +6,12 @@
 // Progress stashes in localStorage (kb.review.{messageId}) so a reload
 // restores the session; the stash clears on finish.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, Eye, Layers } from "lucide-react";
 import {
   USER_ID,
   cardPayload,
+  finishReviewSession,
   submitReviewResult,
   type ChatMessage,
   type ReviewItem,
@@ -40,13 +41,17 @@ function readDraft(messageId: number): ReviewDraft | null {
   }
 }
 
-export default function InlineReview({ message }: { message: ChatMessage }) {
+export default function InlineReview({ message, conversationId }: { message: ChatMessage; conversationId: number }) {
   const args = (cardPayload(message)) as {
     message_id?: number;
     items?: ReviewItem[];
+    completed?: boolean;
   };
   const items = args.items ?? [];
   const messageId = args.message_id ?? message.id;
+  // Server-stamped completion survives cache clears and other devices;
+  // the localStorage draft only covers the in-progress session.
+  const serverDone = args.completed === true;
 
   const [draft, setDraft] = useState<ReviewDraft>(
     () => readDraft(messageId) ?? { index: 0, rated: [] }
@@ -54,7 +59,22 @@ export default function InlineReview({ message }: { message: ChatMessage }) {
   const [index, setIndex] = useState(() => readDraft(messageId)?.index ?? 0);
   const [revealed, setRevealed] = useState(false);
   const [saving, setSaving] = useState(false);
-  const done = draft.rated.length >= items.length && items.length > 0;
+  const localDone = draft.rated.length >= items.length && items.length > 0;
+  const done = serverDone || localDone;
+
+  // First time the session completes locally, stamp it server-side so the
+  // card renders done on reloads and other devices (and can't be re-rated
+  // into duplicate SM-2 writes). Best-effort: local state already covers
+  // this client.
+  const finishSent = useRef(serverDone);
+  useEffect(() => {
+    if (done && !finishSent.current) {
+      finishSent.current = true;
+      finishReviewSession(conversationId, messageId).catch(() => {
+        finishSent.current = false;
+      });
+    }
+  }, [done, conversationId, messageId]);
 
   useEffect(() => {
     try {
@@ -103,7 +123,9 @@ export default function InlineReview({ message }: { message: ChatMessage }) {
         <Check size={20} className="mx-auto text-accent" />
         <p className="text-sm font-semibold text-foreground">Review complete</p>
         <p className="text-xs text-muted-foreground">
-          {items.length} recalled · {knew} solid — schedules updated.
+          {draft.rated.length > 0
+            ? `${items.length} recalled · ${knew} solid — schedules updated.`
+            : "Session finished — schedules updated."}
         </p>
       </div>
     );

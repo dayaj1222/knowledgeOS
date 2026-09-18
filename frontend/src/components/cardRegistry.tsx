@@ -3,6 +3,8 @@
 // Unknown kinds render a graceful placeholder (never crash, never vanish).
 
 import InlineClarify from "./InlineClarify";
+import InlineDemo from "./InlineDemo";
+import InlineFigure from "./InlineFigure";
 import InlineQuiz from "./InlineQuiz";
 import InlineReview from "./InlineReview";
 import InlineVideo from "./InlineVideo";
@@ -38,8 +40,10 @@ const RENDERERS: Record<string, (message: ChatMessage, ctx: CardContext) => Reac
   clarify: (message, ctx) => (
     <InlineClarify message={message} busy={ctx.busy} onAnswer={ctx.onClarifyAnswer} />
   ),
-  review: (message) => <InlineReview message={message} />,
+  review: (message, ctx) => <InlineReview message={message} conversationId={ctx.conversationId} />,
   video: (message) => <InlineVideo message={message} />,
+  demo: (message) => <InlineDemo message={message} />,
+  figure: (message) => <InlineFigure message={message} />,
 };
 
 export function renderCard(message: ChatMessage, ctx: CardContext): React.ReactNode {

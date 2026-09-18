@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, time
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 
 # ---- Base config ----
@@ -404,8 +404,17 @@ class DrillRequest(BaseModel):
 class ChatRequest(BaseModel):
     user_id: int = 1
     conversation_id: int | None = None
-    message: str = Field(min_length=1, max_length=8000)
+    message: str = Field(min_length=0, max_length=8000)
     ui_context: dict | None = None  # {route, course_id, course_name, ...}
+    # Pasted/dropped images as data URLs (image/png or image/jpeg). The
+    # proxy forwards ONE image per turn — extras are ignored server-side.
+    images: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _need_text_or_image(self):
+        if not self.message.strip() and not (self.images or []):
+            raise ValueError("message or images required")
+        return self
 
 
 class ChatMessageOut(ORMModel):

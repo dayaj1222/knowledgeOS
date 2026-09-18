@@ -14,10 +14,13 @@ export default function ChatComposer({
   onSend,
 }: {
   busy: boolean;
-  onSend: (text: string) => void;
+  onSend: (text: string, image?: string | null) => void;
 }) {
   const [input, setInput] = useState("");
   const [commandIndex, setCommandIndex] = useState(0);
+  // One attached image per message (proxy forwards one per turn). Paste or
+  // drop to attach; a new paste replaces. Downscaled client-side ≤1600px.
+  const [image, setImage] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const commandMenuOpen = input.startsWith("/") && !input.includes(" ");
@@ -37,14 +40,70 @@ export default function ChatComposer({
     [commandMenuOpen, input]
   );
 
+  function fileToDataUrl(file: File): Promise<string | null> {
+    if (!file.type.startsWith("image/")) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        const max = 1600;
+        const scale = Math.min(1, max / Math.max(img.width, img.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        canvas.getContext("2d")?.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", 0.85));
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve(null);
+      };
+      img.src = url;
+    });
+  }
+
+  async function attachFiles(files: FileList | File[] | null) {
+    if (!files) return;
+    for (const f of Array.from(files)) {
+      const dataUrl = await fileToDataUrl(f);
+      if (dataUrl) {
+        setImage(dataUrl);
+        return; // one image per message
+      }
+    }
+  }
+
   function submit(text: string) {
-    if (!text.trim() || busy) return;
+    if ((!text.trim() && !image) || busy) return;
     setInput("");
-    onSend(text);
+    const attached = image;
+    setImage(null);
+    onSend(text, attached);
   }
 
   return (
-    <div className="border-t border-border px-5 py-3.5">
+    <div
+      className="border-t border-border px-5 py-3.5"
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={(e) => {
+        e.preventDefault();
+        void attachFiles(e.dataTransfer.files);
+      }}
+    >
+      {image && (
+        <div className="relative inline-block mb-2">
+          <img src={image} alt="Attached" className="h-16 rounded-lg border border-border" />
+          <button
+            type="button"
+            onClick={() => setImage(null)}
+            title="Remove image"
+            className="absolute -top-2 -right-2 w-5 h-5 rounded-full bg-muted text-muted-foreground hover:text-foreground border border-border text-xs leading-none"
+          >
+            ×
+          </button>
+        </div>
+      )}
       <div className="relative">
         {commandMenuOpen && commandMatches.length > 0 && (
           <div className="absolute bottom-full left-0 mb-2 w-64 rounded-xl bg-card border border-border shadow-lg overflow-hidden z-30">
@@ -82,6 +141,9 @@ export default function ChatComposer({
             id="tutor-composer"
             ref={inputRef}
             value={input}
+            onPaste={(e) => {
+              void attachFiles(e.clipboardData.files);
+            }}
             onChange={(e) => {
               setInput(e.target.value);
               setCommandIndex(0);
@@ -120,7 +182,9 @@ export default function ChatComposer({
           />
           <button
             type="submit"
-            disabled={busy || !input.trim()}
+            // An image can be the entire prompt, so text is not required to
+            // enable sending once an attachment has been prepared.
+            disabled={busy || (!input.trim() && !image)}
             className="btn text-xs p-0 shrink-0 w-10 h-10 rounded-lg flex items-center justify-center"
             title="Send"
           >

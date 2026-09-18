@@ -45,11 +45,16 @@ class LLMConfig:
 class AgentConfig:
     tag_batch_size: int = field(default_factory=lambda: int(_get("agent", "tag_batch_size", 5)))
     tag_parallel: bool = field(default_factory=lambda: str(_get("agent", "tag_parallel", "false")).lower() in ("1", "true", "yes", "on"))
+    # Privileged local-machine capabilities stay opt-in.  An LLM must never
+    # receive raw SQL or arbitrary Python execution merely because it can see
+    # their schemas in the tool list.
+    enable_admin_tools: bool = field(default_factory=lambda: str(_get("agent", "enable_admin_tools", "false")).lower() in ("1", "true", "yes", "on"))
+    enable_code_execution: bool = field(default_factory=lambda: str(_get("agent", "enable_code_execution", "false")).lower() in ("1", "true", "yes", "on"))
 
 
 @dataclass(frozen=True)
 class IngestConfig:
-    chunk_tokens: int = field(default_factory=lambda: int(_get("ingest", "chunk_tokens", 800)))
+    chunk_tokens: int = field(default_factory=lambda: int(_get("ingest", "chunk_tokens", 200)))
     overlap_tokens: int = field(default_factory=lambda: int(_get("ingest", "overlap_tokens", 100)))
     max_upload_mb: int = field(default_factory=lambda: int(_get("ingest", "max_upload_mb", 50)))
 

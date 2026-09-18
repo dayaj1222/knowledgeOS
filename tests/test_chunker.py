@@ -89,3 +89,46 @@ def test_long_prose_splits_at_sentences():
 def test_empty_input_no_chunks():
     assert chunk_text("") == []
     assert chunk_text("   \n\n  ") == []
+
+
+def test_figure_block_never_splits():
+    fig = '<image-text page="3" image="1">\n' + "Detail line.\n" * 120 + "</image-text>"
+    chunks = chunk_text("# Diagrams\n\nSome intro.\n\n" + fig + "\n\nTrailing note.\n")
+    holders = [c for c in chunks if "<image-text" in c["content"]]
+    assert len(holders) == 1
+    assert "</image-text>" in holders[0]["content"]
+
+
+def test_long_list_stays_together():
+    items = "\n".join(f"- Item {i} with some descriptive text here." for i in range(40))
+    chunks = chunk_text("# Rules\n\n" + items + "\n")
+    holders = [c for c in chunks if "- Item 0" in c["content"]]
+    assert len(holders) == 1
+    assert "- Item 39" in holders[0]["content"]
+
+
+def test_chunk_cap_200_tokens():
+    prose = "# Essay\n\n" + " ".join(f"Sentence number {i} makes a claim." for i in range(120))
+    chunks = chunk_text(prose)
+    assert len(chunks) > 1
+    for c in chunks:
+        assert len(c["content"]) // 4 <= 260  # cap 200 + sentence slack
+
+
+def test_figure_close_tags_survive_boilerplate_strip():
+    """Regression: the shared </image-text> line repeats per figure — it
+    must never count as boilerplate, or figures merge into one chunk."""
+    figs = "\n\n".join(
+        f'<image-text page="{i}" image="1">\nShared caption line.\n'
+        + f"Figure {i} body. " * 60 + "\n</image-text>"
+        for i in range(1, 5)
+    )
+    doc = "# Deck\n\nIntro.\n\n" + figs + "\n"
+    clean, stripped = strip_boilerplate(doc)
+    assert "</image-text>" in clean
+    assert "Shared caption line." in clean  # repeated content inside figures kept
+    chunks = chunk_text(doc)
+    holders = [c for c in chunks if "<image-text" in c["content"]]
+    # Each figure exceeds the cap alone → one chunk each, closes intact.
+    assert len(holders) == 4, f"figures merged: {len(holders)}"
+    assert all("</image-text>" in c["content"] for c in holders)

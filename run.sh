@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
-# Run the knowledge-base app: FastAPI backend (:8000) + Vite frontend (:5173).
-# Ctrl+C stops both.
+# Run the local production build: Vite assets served by FastAPI on :8000.
+# Ctrl+C stops the app.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BACKEND_PID=""
-FRONTEND_PID=""
 
 cleanup() {
   echo
   echo "Shutting down..."
   if [[ -n "$BACKEND_PID" ]]; then kill "$BACKEND_PID" 2>/dev/null || true; fi
-  if [[ -n "$FRONTEND_PID" ]]; then kill "$FRONTEND_PID" 2>/dev/null || true; fi
-  # kill the whole process groups (uvicorn/vite spawn children)
+  # kill the whole process group (uvicorn may spawn children)
   [[ -n "$BACKEND_PID" ]] && pkill -P "$BACKEND_PID" 2>/dev/null || true
-  [[ -n "$FRONTEND_PID" ]] && pkill -P "$FRONTEND_PID" 2>/dev/null || true
   wait 2>/dev/null || true
   exit 0
 }
@@ -55,21 +52,20 @@ close_port() {
 }
 
 close_port 8000
-close_port 5173
+# Build once, then serve the production assets from FastAPI. Vite's dev
+# server and hot reload are intentionally not part of this launcher.
+echo "Building frontend production assets ..."
+cd "$ROOT/frontend"
+npm run build
 
-echo "Starting backend on http://localhost:8000 ..."
+echo "Starting app on http://localhost:8000 ..."
 cd "$ROOT"
 uv run uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 &
 BACKEND_PID=$!
 
-echo "Starting frontend on http://localhost:5173 ..."
-cd "$ROOT/frontend"
-npm run dev &
-FRONTEND_PID=$!
-
 echo
-echo "  backend:  http://localhost:8000  (health: /health)"
-echo "  frontend: http://localhost:5173"
+echo "  app:    http://localhost:8000"
+echo "  health: http://localhost:8000/health"
 echo
 echo "Press Ctrl+C to stop both."
 wait

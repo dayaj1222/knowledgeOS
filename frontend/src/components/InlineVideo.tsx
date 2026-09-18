@@ -9,11 +9,15 @@ import { cardPayload } from "../api";
 
 function VideoCard({ video }: { video: VideoItem }) {
   const [playing, setPlaying] = useState(false);
+  const startSeconds = video.start_seconds ?? 0;
+  const startAt = Number.isFinite(startSeconds) && startSeconds > 0
+    ? `&start=${Math.floor(startSeconds)}`
+    : "";
   return (
     <div className="rounded-xl overflow-hidden bg-black/40 border border-border/60">
       {playing ? (
         <iframe
-          src={`${video.embed_url}?autoplay=1&rel=0`}
+          src={`${video.embed_url}?autoplay=1&rel=0${startAt}`}
           title={video.title}
           allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
           allowFullScreen
@@ -60,6 +64,11 @@ function VideoCard({ video }: { video: VideoItem }) {
         {video.snippet && (
           <p className="text-[11px] text-muted-foreground line-clamp-2 mt-0.5">
             {video.snippet}
+          </p>
+        )}
+        {video.timestamp_label && (
+          <p className="mt-1 text-[11px] font-medium text-accent">
+            Starts at {video.timestamp_label} — caption match
           </p>
         )}
       </div>

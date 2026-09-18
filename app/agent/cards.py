@@ -1,7 +1,7 @@
 """Inline cards: the registry between tool results and chat UI.
 
-A card is one renderable unit (quiz | clarify | review | todo | video) with
-a validated payload dict. Rules:
+A card is one renderable unit (quiz | clarify | review | todo | video |
+demo) with a validated payload dict. Rules:
 - capture: each triggering tool maps its result to a payload (or None).
 - kinds are closed: CARD_KINDS. Unknown kinds never persist.
 - payloads carry the keys in REQUIRED_KEYS; violations raise (our own
@@ -23,7 +23,7 @@ from .. import models
 
 log = logging.getLogger(__name__)
 
-CARD_KINDS = ("quiz", "clarify", "review", "todo", "video")
+CARD_KINDS = ("quiz", "clarify", "review", "todo", "video", "demo", "figure")
 
 # Trigger tool -> (card kind, first-wins?). todo is last-wins (plan evolves);
 # the rest keep the turn's first payload.
@@ -35,10 +35,12 @@ TRIGGERS: dict[str, tuple[str, bool]] = {
     "stop_timer": ("timer", True),
     "update_todo": ("todo", False),
     "find_videos": ("video", True),
+    "show_demo": ("demo", True),
+    "plot_chart": ("figure", True),
 }
 
 # Persisted kinds only (timer rides the turn payload, not the DB).
-PERSISTED_KINDS = ("quiz", "clarify", "review", "todo", "video")
+PERSISTED_KINDS = ("quiz", "clarify", "review", "todo", "video", "demo", "figure")
 
 REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "quiz": ("assessment_id", "questions"),
@@ -46,7 +48,14 @@ REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "review": ("items",),
     "todo": ("todos",),
     "video": ("videos",),
+    "demo": ("html",),
+    "figure": ("image",),
 }
+
+# Self-contained interactive demos: hard caps (DB weight + render safety).
+DEMO_HTML_MAX = 30_000
+DEMO_HEIGHT_MIN = 200
+DEMO_HEIGHT_MAX = 800
 
 
 def slim(kind: str, payload: dict) -> dict:
@@ -75,6 +84,22 @@ def slim(kind: str, payload: dict) -> dict:
         }
     if kind == "video":
         return {"videos": payload.get("videos", [])}
+    if kind == "demo":
+        try:
+            height = int(payload.get("height", 420))
+        except (TypeError, ValueError):
+            height = 420
+        return {
+            "title": str(payload.get("title", "Interactive demo"))[:120],
+            "html": payload["html"],
+            "height": max(DEMO_HEIGHT_MIN, min(DEMO_HEIGHT_MAX, height)),
+        }
+    if kind == "figure":
+        return {
+            "title": str(payload.get("title", "Figure"))[:120],
+            "image": payload["image"],
+            "stdout": str(payload.get("stdout", ""))[:2000],
+        }
     if kind == "timer":
         out: dict = {"action": payload.get("action")}
         if payload.get("action") == "start":
