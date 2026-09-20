@@ -7,41 +7,44 @@ materials, and keep track of what to review next.
 
 ## Features
 
-### Your learning library
-
-Organize every course into modules and topics, then upload notes, slides, PDFs,
-and other study materials. Documents are processed in the background and made
-available as searchable passages, with room for notes and annotations along the
-way.
-
-### AI tutor, grounded in your material
-
-Chat with a tutor that can find relevant passages from your library, explain
-concepts, create diagrams, and remember useful context from previous sessions.
-It can also search the web when your material needs a little extra context.
-
-### Practice as you study
-
-Ask for a quiz directly in the conversation. Questions appear as simple,
-one-at-a-time cards; when you finish, the tutor uses your results to explain
-what you understand and what is worth revisiting.
-
-### A plan that adapts
-
-Track proficiency, weak points, review schedules, study time, and deadlines.
-KnowlegeOS uses that information to help shape study plans around the areas
-that need the most attention.
-
-### Private by default
-
-Your database, uploads, and chat history stay on your machine. Only the content
-sent to the LLM endpoint you configure leaves the app.
+- **Organized course library** — structure courses into modules and topics;
+  upload syllabi, PDFs, slides, and notes; then annotate useful passages.
+- **Intelligent material processing** — extract document text, describe useful
+  figures, split content into meaningful passages, and make it retrievable by
+  topic.
+- **Grounded AI tutoring** — stream a conversation with a tutor that retrieves
+  relevant course passages, explains concepts, creates diagrams, and retains
+  useful learner context.
+- **Interactive visualizations and demos** — share images in chat, view
+  generated figures and Mermaid diagrams, and launch safe, self-contained
+  `show_demo` simulations that make abstract processes easier to explore.
+- **In-chat quizzes and grading** — practice with one question at a time,
+  receive a tutor-led debrief, and use the results to identify strengths and
+  gaps.
+- **Spaced review** — turn key ideas into recall cards and schedule follow-up
+  reviews with SM-2 repetition based on demonstrated understanding.
+- **Adaptive study plans** — track proficiency, weak points, study time,
+  deadlines, and active step-by-step learning plans that move at the learner's
+  pace.
+- **YouTube learning support** — find relevant educational videos without an
+  API key, verify them against topic material using available captions, and
+  open an embedded player at the most relevant timestamp.
+- **Web research when needed** — supplement library material with focused web
+  search and page retrieval when a question calls for current or broader
+  context.
+- **Local-first privacy** — materials, database records, and chat history stay
+  on your machine; only content sent to your configured LLM endpoint leaves the
+  app.
 
 ## Screenshots
 
 | Tutor | Learning library | Quiz practice |
 |---|---|---|
 | ![Tutor conversation](assets/tutor.png) | ![Course library](assets/library.png) | ![Inline quiz](assets/quiz-practice.png) |
+
+| YouTube learning | Show Demo visualizations |
+|---|---|
+| ![Verified YouTube recommendation](assets/youtube-video.png) | ![Interactive Show Demo visualization](assets/visualizations.png) |
 
 ## Get started
 
