@@ -1,4 +1,4 @@
-# knowledge-base configuration — source of truth for tunables.
+# knowlegeos configuration — source of truth for tunables.
 
 [llm]
 base_url = "http://127.0.0.1:9173/v1"

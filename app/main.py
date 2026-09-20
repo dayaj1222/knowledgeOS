@@ -16,6 +16,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .database import init_db
 from .errors import register_error_handlers
+from .ingest.storage import STORAGE_DIR
 from .routers import chat, courses, questions, resources, schedule, topics
 
 
@@ -57,6 +58,9 @@ def create_app() -> FastAPI:
     app.include_router(questions.router)
     app.include_router(schedule.router)
     app.include_router(chat.router)
+    # Chat attachments are local files; mount before the SPA catch-all.
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount("/storage", StaticFiles(directory=STORAGE_DIR), name="storage")
 
     @app.get("/health")
     def health():

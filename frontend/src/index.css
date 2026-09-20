@@ -4,26 +4,26 @@
 .dark,
 [data-theme="dark"] {
   color-scheme: dark;
-  --base: #141716;
-  --mantle: #1b201e;
-  --crust: #0e1110;
-  --text: #f5f7f6;
-  --subtext: #abb5b0;
-  --accent: #5ba879;
-  --accent-hover: #70ba8d;
-  --accent-light: #a6d9b7;
-  --green: #6bb687;
+  --base: #0f172a;
+  --mantle: #172033;
+  --crust: #0b1220;
+  --text: #e5e7eb;
+  --subtext: #94a3b8;
+  --accent: #845ef0;
+  --accent-hover: #9775fa;
+  --accent-light: #d0bfff;
+  --green: #22c55e;
   --red: #e5484d;
   --amber: #f5a524;
-  --surface: #252b28;
-  --surface-hover: #303834;
+  --surface: #1e293b;
+  --surface-hover: #273449;
 
   /* shadcn/ui semantic tokens */
   --background: var(--base);
   --foreground: var(--text);
   --card: var(--mantle);
   --card-foreground: var(--text);
-  --popover: #202622;
+  --popover: #172033;
   --popover-foreground: var(--text);
   --primary: var(--accent);
   --primary-foreground: #ffffff;
@@ -34,31 +34,31 @@
   --accent-foreground: #ffffff;
   --destructive: var(--red);
   --destructive-foreground: #ffffff;
-  --border: #3a4640;
-  --input: #202622;
+  --border: #2e3b52;
+  --input: #131c2c;
   --ring: var(--accent);
   --radius: 0.375rem;
 
-  --scrollbar-thumb: #53605a;
-  --scrollbar-thumb-hover: #6c7b73;
+  --scrollbar-thumb: #3b4b66;
+  --scrollbar-thumb-hover: #51637f;
 }
 
 .light,
 [data-theme="light"] {
   color-scheme: light;
-  --base: #fafbfa;
+  --base: #f8fafc;
   --mantle: #ffffff;
-  --crust: #f1f4f2;
-  --text: #202723;
-  --subtext: #6d7771;
-  --accent: #4b9769;
-  --accent-hover: #3e8059;
-  --accent-light: #7cba93;
-  --green: #4b9769;
-  --red: #ce2c31;
-  --amber: #a05e00;
-  --surface: #f0f3f1;
-  --surface-hover: #e7ece9;
+  --crust: #f1f5f9;
+  --text: #172033;
+  --subtext: #64748b;
+  --accent: #7048e8;
+  --accent-hover: #5f3dc4;
+  --accent-light: #d0bfff;
+  --green: #16a34a;
+  --red: #dc2626;
+  --amber: #b45309;
+  --surface: #eef2f7;
+  --surface-hover: #e2e8f0;
 
   /* shadcn/ui semantic tokens */
   --background: var(--base);
@@ -76,13 +76,13 @@
   --accent-foreground: #ffffff;
   --destructive: var(--red);
   --destructive-foreground: #ffffff;
-  --border: #dce3de;
+  --border: #d9e0ea;
   --input: #ffffff;
   --ring: var(--accent);
   --radius: 0.375rem;
 
-  --scrollbar-thumb: #cbd4ce;
-  --scrollbar-thumb-hover: #acbbb1;
+  --scrollbar-thumb: #cbd5e1;
+  --scrollbar-thumb-hover: #94a3b8;
 }
 
 @theme inline {

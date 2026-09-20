@@ -261,6 +261,10 @@ def search_videos(query: str, count: int = 3) -> dict:
 
 TRANSCRIPT_MAX_CHARS = 6000
 TRANSCRIPT_MAX_SEGMENTS = 400
+# Caption windows overlap heavily. Embedding all of them can make the ONNX
+# runtime reserve several GB, so dense reranking has a fixed small budget.
+CAPTION_DENSE_CANDIDATES = 24
+CAPTION_LEXICAL_SEED = 12
 
 _STOPWORDS = frozenset(
     "the a an and or of to in on for with is are was were be been by as at "
@@ -389,42 +393,102 @@ def _timestamp_label(seconds: float) -> str:
     return f"{total // 60}:{total % 60:02d}"
 
 
-def select_transcript_moment(segments: list[dict], query: str, topic_text: str = "") -> dict | None:
-    """Find the caption-window that best answers a video's search query.
-
-    This is deliberately deterministic rather than another model call: the
-    same evidence that verifies a video chooses its seek point, with no new
-    tool arguments or prompt instructions needed.
-    """
-    wanted = _keywords(query)
-    fallback = _keywords(topic_text)
-    if not segments or not (wanted or fallback):
-        return None
-    best: tuple[float, int, str] | None = None
-    for index, segment in enumerate(segments):
-        window = segments[index:index + 3]
-        caption = str(segment.get("text", "")).strip()
-        keys = _keywords(caption)
-        if not keys:
+def _caption_windows(segments: list[dict], seconds: int = 35) -> list[dict]:
+    """Create short, overlap-friendly timestamped caption windows."""
+    windows: list[dict] = []
+    for index in range(len(segments)):
+        try:
+            start = max(0, int(float(segments[index].get("start", 0))))
+        except (TypeError, ValueError):
             continue
-        query_score = len(keys & wanted) / len(wanted) if wanted else 0.0
-        topic_score = len(keys & fallback) / len(fallback) if fallback else 0.0
-        score = 0.8 * query_score + 0.2 * topic_score
-        if best is None or score > best[0]:
-            excerpt = " ".join(str(part.get("text", "")) for part in window).strip()
-            best = (score, index, excerpt)
-    if best is None or best[0] == 0:
-        return None
-    _, index, excerpt = best
+        parts: list[str] = []
+        for segment in segments[index:]:
+            try:
+                at = float(segment.get("start", start))
+            except (TypeError, ValueError):
+                at = start
+            if parts and at >= start + seconds:
+                break
+            text = str(segment.get("text", "")).strip()
+            if text:
+                parts.append(text)
+        text = " ".join(parts).strip()
+        if text:
+            windows.append({"start_seconds": start, "text": text[:700]})
+    return windows
+
+
+def hybrid_caption_candidates(
+    segments: list[dict],
+    focus: str,
+    topic_text: str,
+    course_passages: list[str],
+    technical_terms: list[str] | None = None,
+    top: int = 5,
+) -> list[dict]:
+    """Retrieve caption moments with dense, lexical, and course-RAG signals.
+
+    The tutor's focus is the primary query. Topic and retrieved course
+    passages corroborate it instead of replacing it, preserving the learner's
+    exact subtopic when the surrounding module is broad.
+    """
+    windows = _caption_windows(segments)
+    focus = focus.strip()
+    if not windows or not focus:
+        return []
+    evidence = " ".join(str(p)[:500] for p in course_passages[:3])
+    semantic_query = f"{focus}\nTopic: {topic_text[:500]}\nCourse evidence: {evidence[:1500]}"
+    lexical_focus = _keywords(" ".join([focus, *(technical_terms or [])]))
+    lexical_context = _keywords(topic_text + " " + evidence)
+
+    def lexical_score(index: int) -> float:
+        terms = _keywords(windows[index]["text"])
+        focus_score = len(terms & lexical_focus) / len(lexical_focus) if lexical_focus else 0.0
+        context_score = len(terms & lexical_context) / len(lexical_context) if lexical_context else 0.0
+        return 0.75 * focus_score + 0.25 * context_score
+
+    lexical_order = sorted(range(len(windows)), key=lexical_score, reverse=True)
+    # Include strong literal matches plus evenly distributed windows for
+    # semantic recall, but never create an unbounded ONNX embedding batch.
+    dense_indices = lexical_order[:CAPTION_LEXICAL_SEED]
+    if len(windows) > CAPTION_LEXICAL_SEED:
+        stride = max(1, len(windows) // (CAPTION_DENSE_CANDIDATES - CAPTION_LEXICAL_SEED))
+        dense_indices.extend(range(0, len(windows), stride))
+    dense_indices = list(dict.fromkeys(dense_indices))[:CAPTION_DENSE_CANDIDATES]
+
+    dense_order: list[int] = []
     try:
-        start = max(0, int(float(segments[index].get("start", 0))))
-    except (TypeError, ValueError):
-        start = 0
-    return {
-        "start_seconds": start,
-        "timestamp_label": _timestamp_label(start),
-        "timestamp_excerpt": excerpt[:220],
-    }
+        from ..ingest.embeddings import embed_texts
+
+        vectors = embed_texts([semantic_query, *[windows[i]["text"] for i in dense_indices]])
+        query_vector = vectors[0]
+        dense_order = sorted(
+            range(len(dense_indices)),
+            key=lambda i: float(query_vector @ vectors[i + 1]),
+            reverse=True,
+        )
+        dense_order = [dense_indices[i] for i in dense_order]
+    except Exception:
+        # Lexical retrieval is still useful when the local embedding model is
+        # unavailable, so caption seeking never makes video playback fail.
+        dense_order = []
+
+    ranks: dict[int, float] = {}
+    # Reciprocal-rank fusion: semantic matching expands recall; exact terms
+    # prevent a near-but-wrong caption from winning technical queries.
+    for order in (dense_order, lexical_order):
+        for rank, index in enumerate(order, start=1):
+            ranks[index] = ranks.get(index, 0.0) + 1.0 / (60 + rank)
+    candidates = []
+    for index in sorted(ranks, key=ranks.get, reverse=True)[:max(1, min(top, 8))]:
+        window = windows[index]
+        candidates.append({
+            "start_seconds": window["start_seconds"],
+            "timestamp_label": _timestamp_label(window["start_seconds"]),
+            "timestamp_excerpt": window["text"][:320],
+            "retrieval_score": round(ranks[index], 5),
+        })
+    return candidates
 
 
 # ---------- fetch ("curl a url") ----------

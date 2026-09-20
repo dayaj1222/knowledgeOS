@@ -31,6 +31,7 @@ import {
   getPreference,
   pinConversation,
   putPreference,
+  chatImageUrl,
   type TutorMemory,
 } from "../api";
 import { useStore } from "../store";
@@ -245,23 +246,17 @@ export default function Tutor() {
     document.getElementById("tutor-composer")?.focus();
   }
 
-  function quotedSend(text: string) {
-    // Quote-reply composes a markdown blockquote above the message, so the
-    // tutor sees exactly which section is being answered (frontend-only).
-    if (!replyTo) return text;
-    const quote = replyTo.text
-      .split("\n")
-      .map((l) => `> ${l}`)
-      .join("\n");
-    return `${quote}\n\n${text}`;
-  }
-
-  async function send(text: string) {
+  async function send(text: string, image?: string | null) {
     if (!text.trim() || busy) return;
     stickRef.current = true; // own message → follow the reply
     setAtBottom(true);
     setSelMenu(null);
-    const body = quotedSend(text);
+    // Reply context belongs in the model-only turn context.  Sending its
+    // transport label as the user's message made that internal syntax appear
+    // in the chat transcript after persistence/reload.
+    const replyTarget: { source: "user" | "tutor"; text: string } | undefined = replyTo
+      ? { source: replyTo.role === "user" ? "user" : "tutor", text: replyTo.text }
+      : undefined;
     setReplyTo(null);
     const cmd = text.trim().toLowerCase();
     if (cmd === "/history") {
@@ -285,7 +280,7 @@ export default function Tutor() {
       await sendStream("Build a study plan for me");
       return;
     }
-    await sendStream(body);
+    await sendStream(text, image, replyTarget);
   }
 
   async function remove(id: number) {
@@ -493,25 +488,25 @@ export default function Tutor() {
               <div
                 className={`group/msg max-w-[75%] rounded-2xl px-4 py-3 text-sm leading-relaxed shadow-sm ${
                   m.role === "user"
-                    ? "bg-primary text-white rounded-br-sm"
+                    ? "bg-accent/25 text-foreground border border-accent/60 rounded-br-sm"
                     : "bg-muted border border-border rounded-bl-sm"
                 }`}
               >
                 {m.role === "user" ? (
                   <>
-                    {m.content && <UserText text={m.content} />}
                     {m.images?.map((image, index) => (
-                      <figure key={`${m.id}-${index}`} className={m.content ? "mt-3" : ""}>
+                      <figure key={`${m.id}-${index}`} className={m.content ? "mb-3" : ""}>
                         <img
-                          src={image}
+                          src={chatImageUrl(image)}
                           alt={`Attached image ${index + 1}`}
-                          className="block max-h-96 max-w-full rounded-xl border border-white/30 bg-black/10 object-contain shadow-sm"
+                          className="block max-h-96 max-w-full rounded-xl border border-accent/30 bg-muted/50 object-contain shadow-sm"
                         />
-                        <figcaption className="mt-1 text-[10px] font-medium text-white/75">
+                        <figcaption className="mt-1 text-[10px] font-medium text-muted-foreground/80">
                           Attached image
                         </figcaption>
                       </figure>
                     ))}
+                    {m.content && <UserText text={m.content} />}
                   </>
                 ) : (
                   <Markdown text={m.content} />
@@ -526,9 +521,9 @@ export default function Tutor() {
                   </button>
                 )}
                 <ToolCalls calls={m.tool_calls ?? []} />
-                <div className="flex items-center gap-2 mt-2 pt-1.5 border-t border-border/40">
+                <div className={`flex items-center gap-2 ${m.role === "user" ? "mt-1.5" : "mt-2 pt-1.5 border-t border-border/40"}`}>
                   {m.created_at && (
-                    <span className="text-[10px] font-mono text-muted-foreground/70">
+                    <span className={`text-[10px] font-mono ${m.role === "user" ? "text-muted-foreground/80" : "text-muted-foreground/70"}`}>
                       {new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                     </span>
                   )}

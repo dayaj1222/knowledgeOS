@@ -26,7 +26,8 @@ def db():
         yield s
 
 
-def test_image_turn_builds_multipart(db):
+def test_image_turn_builds_multipart(db, monkeypatch):
+    monkeypatch.setattr(tutor, "persist_chat_image", lambda cid, _: f"/storage/chat-images/chat-{cid}-test.jpg")
     cid, messages, _ = tutor._open_turn(
         db, 1, None, "what is this?", None, ["data:image/jpeg;base64,AAA"])
     user_msg = messages[-1]
@@ -37,7 +38,7 @@ def test_image_turn_builds_multipart(db):
     assert parts[1] == {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}}
     row = db.query(models.ChatMessage).filter_by(conversation_id=cid).one()
     assert row.content == "what is this?"
-    assert row.images == ["data:image/jpeg;base64,AAA"]
+    assert row.images == [f"/storage/chat-images/chat-{cid}-test.jpg"]
 
 
 def test_text_only_turn_unchanged(db):
@@ -45,6 +46,21 @@ def test_text_only_turn_unchanged(db):
     assert isinstance(messages[-1]["content"], str)
     row = db.query(models.ChatMessage).filter_by(conversation_id=cid).one()
     assert row.content == "plain question"
+
+
+def test_reply_target_is_hidden_context_not_persisted_message(db):
+    cid, messages, _ = tutor._open_turn(
+        db,
+        1,
+        None,
+        "What method are we using?",
+        {"reply_target": {"source": "tutor", "text": "Expected counts are built from margins."}},
+    )
+    row = db.query(models.ChatMessage).filter_by(conversation_id=cid).one()
+    assert row.content == "What method are we using?"
+    content = messages[-1]["content"]
+    assert "[REPLY TARGET]" in content
+    assert "Expected counts are built from margins." in content
 
 
 def test_streaming_image_turn_uses_multimodal_completion(monkeypatch):

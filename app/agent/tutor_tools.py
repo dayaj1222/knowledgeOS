@@ -40,12 +40,13 @@ from .tool_args import (
 )
 from .tool_policy import tool_enabled
 from .tool_visuals import plot_chart, run_code, show_demo
+from .web import _keywords as _caption_keywords
 from .web import fetch_transcript as _fetch_transcript
 from .web import fetch_url as _fetch_url
+from .web import hybrid_caption_candidates as _hybrid_caption_candidates
 from .web import score_relevance as _score_relevance
 from .web import search_videos as _search_videos
 from .web import search_web as _search_web
-from .web import select_transcript_moment as _select_transcript_moment
 
 # Current turn's conversation id (set by tutor.py around each tool call).
 # Lets convo-scoped tools (set_context) act without signature churn.
@@ -382,7 +383,7 @@ def fetch_url(db, user_id: int, args: dict) -> dict:
     return _fetch_url(url, max_chars)
 
 
-def find_videos(db, user_id: int, args: dict) -> dict:
+async def find_videos(db, user_id: int, args: dict) -> dict:
     """Choose one best YouTube video after transcript-based comparison.
 
     A small candidate set is checked against the topic's passages, but only
@@ -393,30 +394,51 @@ def find_videos(db, user_id: int, args: dict) -> dict:
     if not query:
         return {"error": "query must be non-empty (topic + concept, e.g. 'priority ceiling protocol explained')"}
     try:
-        topic_id = int(args["topic_id"])
-    except (KeyError, TypeError, ValueError):
-        return {
-            "videos": [],
-            "error": "topic_id is required so captions can be verified against the learner's material",
-        }
-    topic = db.get(models.Topic, topic_id)
-    if topic is None:
+        topic_id = int(args["topic_id"]) if args.get("topic_id") is not None else None
+    except (TypeError, ValueError):
+        return {"videos": [], "error": "topic_id must be a valid topic when provided"}
+    topic = db.get(models.Topic, topic_id) if topic_id is not None else None
+    if topic_id is not None and topic is None:
         return {"videos": [], "error": f"topic {topic_id} not found; cannot verify captions"}
     try:
-        count = max(3, min(int(args.get("count", 3)), 5))
+        count = max(3, min(int(args.get("count", 5)), 5))
     except (TypeError, ValueError):
         count = 3
     result = _search_videos(query, count)
     videos = result.get("videos", [])
     if not videos:
         return {"videos": [], "hint": "No videos found — teach from passages instead."}
-    # Verification: caption track vs the topic's own text.
-    from ..services.retrieval import grounding_for_topic
+    focus = str(args.get("focus") or query).strip()
+    technical_terms = [str(term)[:80] for term in (args.get("technical_terms") or [])][:8]
+    # Without a topic this is external study: match captions to the requested
+    # concept, but never claim the video was verified against course material.
+    topic_name = topic.name if topic is not None else focus
+    topic_description = topic.description or "" if topic is not None else ""
+    course_passages: list[str] = []
+    topic_text = focus
+    if topic is not None:
+        from ..services.retrieval import grounding_for_topic
 
-    topic_name = topic.name or ""
-    parts = [topic_name, topic.description or ""]
-    parts.extend(c[:800] for c in grounding_for_topic(db, topic))
-    topic_text = "\n".join(parts)
+        course_passages = grounding_for_topic(db, topic)[:3]
+        # A model can accidentally attach an unrelated library ID to an
+        # external discussion (e.g. B+ trees with a Probability topic ID).
+        # Never turn that bookkeeping mistake into a blanket rejection of
+        # useful caption evidence. Only claim syllabus verification when the
+        # requested concept shares at least one meaningful term with the topic
+        # identity or its grounded passages; otherwise use the external path.
+        request_terms = _caption_keywords(" ".join([focus, *technical_terms]))
+        topic_terms = _caption_keywords(" ".join([
+            topic.name or "", topic.description or "", *course_passages,
+        ]))
+        if request_terms and not (request_terms & topic_terms):
+            topic = None
+            course_passages = []
+            topic_name = focus
+            topic_description = ""
+        else:
+            topic_name = topic.name
+            topic_description = topic.description or ""
+        topic_text = "\n".join([topic_name, topic_description, *(c[:800] for c in course_passages)])
     verified_videos: list[dict] = []
     for v in videos:
         tr = _fetch_transcript(v["video_id"])
@@ -425,20 +447,20 @@ def find_videos(db, user_id: int, args: dict) -> dict:
         scored = _score_relevance(tr["full_text"], topic_text, topic_name)
         v["relevance"] = scored["relevance"]
         v["matched"] = scored["matched"]
-        v["verified"] = scored["relevance"] >= 0.3
+        v["verified"] = scored["relevance"] >= (0.3 if topic is not None else 0.2)
         if v["verified"]:
-            moment = _select_transcript_moment(
-                tr.get("segments") or [], query, topic_text
-            )
-            if moment:
-                v.update(moment)
+            # Only the selected video needs timestamp retrieval. Previously
+            # this performed a large embedding batch for every candidate.
+            v["_segments"] = tr.get("segments") or []
+            v["external"] = topic is None
             verified_videos.append(v)
     verified_videos.sort(key=lambda v: v["relevance"], reverse=True)
     if not verified_videos:
         return {
             "type": "video",
             "videos": [],
-            "hint": "No candidate had captions that could be verified against this topic's material.",
+            "hint": ("No candidate had captions that could be verified against this topic's material."
+                     if topic is not None else "No candidate's captions matched the requested concept."),
         }
     # Video cards are persisted after each completed turn, giving a durable
     # per-conversation history for "show me another" requests.
@@ -461,13 +483,41 @@ def find_videos(db, user_id: int, args: dict) -> dict:
             "videos": [],
             "hint": "All transcript-ranked candidates were already shown; refine the topic or query.",
         }
+    # The main tutor call supplied ``query``; the reranker now chooses only
+    # among hybrid-retrieved caption moments, so it cannot invent a seek time.
+    candidates = _hybrid_caption_candidates(
+        selected.pop("_segments", []), focus,
+        f"{topic_name}\n{topic_description}" if topic is not None else "",
+        course_passages, technical_terms,
+    )
+    if candidates:
+        from ..ai import choose_video_moment
+
+        choice = await choose_video_moment(
+            focus, f"{topic_name}: {topic_description}",
+            course_passages, candidates,
+        )
+        if choice is not None:
+            moment = next(
+                (candidate for candidate in candidates
+                 if candidate["start_seconds"] == choice["start_seconds"]),
+                None,
+            )
+            if moment is not None:
+                selected.update({
+                    "start_seconds": moment["start_seconds"],
+                    "timestamp_label": moment["timestamp_label"],
+                    "timestamp_excerpt": moment["timestamp_excerpt"],
+                    "seek_confidence": choice["seek_confidence"],
+                })
     return {
         "type": "video",
         "videos": [selected],
         "candidates_checked": len(videos),
         "hint": (
             "This is the single best unseen candidate after transcript ranking "
-            "and syllabus verification. If the learner asks for another, "
+            + ("and syllabus verification. " if topic is not None else "for the requested external concept. ")
+            + "If the learner asks for another, "
             "call this tool again to return the next best unseen result. "
             "Introduce it in 1-2 sentences, then end with: VIDEO_READY — do "
             "NOT paste raw URLs."
@@ -996,20 +1046,22 @@ TOOLS: dict[str, dict[str, Any]] = {
         "run": fetch_url,
     },
     "find_videos": {
-        "signature": '(query: str, count?: int, topic_id?: int)',
+        "signature": '(query: str, count?: int, topic_id?: int, focus?: str, technical_terms?: str[])',
         "description": (
             "Find one YouTube video for a topic — renders INLINE as an embedded "
             "players in the chat (thumbnail → click to play). Pass topic_id "
-            "to VERIFY candidates against the topic's passages (caption-track "
-            "overlap); unverified candidates are never returned. Use when "
+            "to verify candidates against local passages; omit it for external "
+            "study, where caption-to-concept matching is used instead. Use when "
             "the learner is stuck after explanations, asks for a video/visual, "
             "or a concept cries out for animation (protocols, algorithms, "
             "waveforms). The tool compares a small candidate set, but returns "
             "ONE best unseen video per call; call it again only when the learner "
             "asks for another. Query with topic + concept words. No confirmation "
-            "needed. Videos supplement the stored passages, never replace them."
+            "needed. For precise caption seeking, optionally include a one-sentence "
+            "focus and up to 8 exact technical_terms. Videos supplement the stored "
+            "passages, never replace them."
         ),
-        "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "count": {"type": "integer"}, "topic_id": {"type": "integer"}}, "required": ["query"]},
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "count": {"type": "integer"}, "topic_id": {"type": "integer"}, "focus": {"type": "string"}, "technical_terms": {"type": "array", "items": {"type": "string"}}}, "required": ["query"]},
         "run": find_videos,
         "args_model": FindVideosArgs,
     },

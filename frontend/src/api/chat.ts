@@ -1,5 +1,9 @@
 import { BASE_URL, USER_ID, request } from "./core/client";
 
+export function chatImageUrl(image: string): string {
+  return image.startsWith("/storage/") ? `${BASE_URL.replace(/\/api$/, "")}${image}` : image;
+}
+
 export interface UiAction { action: string; params: Record<string, unknown> }
 export interface ToolCall { tool: string; args: unknown; result_preview?: string | null }
 export interface QuizQuestion { id: number; topic_id: number; text: string; type: string; expected_key_points?: unknown[] }
@@ -8,14 +12,14 @@ export interface InlineClarifyPayload { message_id: number; question: string; op
 export interface ReviewItem { topic_id: number; topic_name: string; prompt: string; key_points: string[] }
 export interface InlineReviewPayload { message_id: number; items: ReviewItem[] }
 export interface TimerPayload { action: "start" | "stop"; topic_id?: number; topic_name?: string; label?: string }
-export interface VideoItem { video_id: string; title: string; url: string; embed_url: string; thumbnail: string; snippet?: string; relevance?: number; verified?: boolean; verify_note?: string; start_seconds?: number; timestamp_label?: string; timestamp_excerpt?: string }
+export interface VideoItem { video_id: string; title: string; url: string; embed_url: string; thumbnail: string; snippet?: string; relevance?: number; verified?: boolean; verify_note?: string; start_seconds?: number; timestamp_label?: string; timestamp_excerpt?: string; seek_confidence?: "high" | "medium" }
 export interface VideoPayload { message_id: number; videos: VideoItem[] }
 export interface TodoItem { content: string; status: "pending" | "in_progress" | "completed"; activeForm?: string; weight?: number }
 export interface TodoPayload { message_id: number; todos: TodoItem[]; total: number; completed: number; current?: string | null; current_active?: string | null }
 export interface ChatTurn { conversation_id: number; reply: string; tool_calls: ToolCall[]; ui_actions: UiAction[]; quiz?: InlineQuizPayload | null; clarify?: InlineClarifyPayload | null; review?: InlineReviewPayload | null; timer?: TimerPayload | null; todo?: TodoPayload | null; video?: VideoPayload | null }
 export interface Conversation { id: number; title: string; module_id?: number | null; module_name?: string | null }
 export interface ChatMessage { id: number; role: string; content: string; images?: string[] | null; tool_calls?: ToolCall[] | null; card?: { kind: string; payload: Record<string, unknown> } | null; created_at?: string | null }
-export interface UiContext { route: string; course_id?: number | null; course_name?: string | null; detail?: string | null; module_id?: number | null }
+export interface UiContext { route: string; course_id?: number | null; course_name?: string | null; detail?: string | null; module_id?: number | null; reply_target?: { source: "user" | "tutor"; text: string } }
 export interface TutorMemory { id: number; key: string; value: string }
 
 export function cardPayload(message: ChatMessage): Record<string, unknown> { return (message.card?.payload ?? (message.tool_calls?.[0]?.args as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>; }

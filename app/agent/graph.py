@@ -148,7 +148,7 @@ def _planning_node(state: TutorTurnState) -> dict:
     from .tutor import _todo_line
 
     plan = _todo_line(state["db"], state["conversation_id"])
-    status = "active" if "PLAN: " in plan and "none active" not in plan else "none"
+    status = "active" if "[ACTIVE STUDY PLAN]" in plan and "no active plan" not in plan else "none"
     return {"plan_status": status}
 
 
@@ -302,7 +302,14 @@ def _tools_node(state: TutorTurnState) -> dict:
     import json
 
     from . import cards as card_registry
-    from .tutor import _dedupe_key, _execute_call, _parse_call, _preview
+    from .tutor import (
+        _dedupe_key,
+        _execute_call,
+        _explicit_move_on,
+        _parse_call,
+        _preview,
+        _todo_update_advances_current_step,
+    )
 
     db = state["db"]
     user_id = state["user_id"]
@@ -323,7 +330,15 @@ def _tools_node(state: TutorTurnState) -> dict:
             })
             continue
         seen.add(key)
-        result, ui_action = _execute_call(db, user_id, name, args)
+        if (
+            name == "update_todo"
+            and _todo_update_advances_current_step(db, state["conversation_id"], args)
+            and not _explicit_move_on(str(state.get("message") or ""))
+        ):
+            result = {"error": "The learner did not explicitly ask to move on. Keep the current plan step active; answer or teach within it instead."}
+            ui_action = None
+        else:
+            result, ui_action = _execute_call(db, user_id, name, args)
         tool_calls.append({"tool": name, "args": args, "result_preview": _preview(result)})
         hit = card_registry.capture(name, result)
         if hit is not None:
@@ -356,7 +371,14 @@ async def _stream_tools_node(state: TutorTurnState) -> dict:
     from langgraph.config import get_stream_writer
 
     from . import cards as card_registry
-    from .tutor import _aexecute_call, _dedupe_key, _parse_call, _preview
+    from .tutor import (
+        _aexecute_call,
+        _dedupe_key,
+        _explicit_move_on,
+        _parse_call,
+        _preview,
+        _todo_update_advances_current_step,
+    )
 
     writer = get_stream_writer()
     messages = list(state.get("messages", []))
@@ -372,7 +394,15 @@ async def _stream_tools_node(state: TutorTurnState) -> dict:
                              "content": json.dumps({"duplicate": True, "cached": True})})
             continue
         seen.add(key)
-        result, ui_action = await _aexecute_call(state["db"], state["user_id"], name, args)
+        if (
+            name == "update_todo"
+            and _todo_update_advances_current_step(state["db"], state["conversation_id"], args)
+            and not _explicit_move_on(str(state.get("message") or ""))
+        ):
+            result = {"error": "The learner did not explicitly ask to move on. Keep the current plan step active; answer or teach within it instead."}
+            ui_action = None
+        else:
+            result, ui_action = await _aexecute_call(state["db"], state["user_id"], name, args)
         preview = _preview(result)
         tool_calls.append({"tool": name, "args": args, "result_preview": preview})
         writer({"type": "tool", "tool": name, "args": args, "result_preview": preview})

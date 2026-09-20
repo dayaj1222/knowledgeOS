@@ -1,5 +1,5 @@
 [project]
-name = "knowledge-base"
+name = "knowlegeos"
 version = "0.1.0"
 description = "Local-first study companion: library, AI tutor chat, quizzes with AI grading, proficiency tracking, and study plans."
 readme = "README.md"

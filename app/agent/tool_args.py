@@ -41,6 +41,8 @@ class FindVideosArgs(BaseModel):
     query: str
     count: int | None = None
     topic_id: int | None = None
+    focus: str | None = None
+    technical_terms: list[str] | None = None
 
 
 class StartTimerArgs(BaseModel):

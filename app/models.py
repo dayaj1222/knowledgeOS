@@ -13,6 +13,7 @@ Schema decisions applied (from review):
 from __future__ import annotations
 
 from datetime import datetime, time
+from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
@@ -503,6 +504,11 @@ class Conversation(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     title: Mapped[str] = mapped_column(String(255), default="Tutor chat")
+    # Opaque, permanent ID for the external LLM provider. It must never be
+    # derived from SQLite's reusable integer primary key.
+    provider_thread_id: Mapped[str] = mapped_column(
+        String(32), unique=True, nullable=False, default=lambda: uuid4().hex
+    )
     # Permanent module pin (None = unpinned free-form chat). Set at creation
     # from ui_context, changed only via set_context on the learner's words —
     # the tutor can never move or drop it on its own.

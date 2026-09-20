@@ -31,11 +31,11 @@ export default function Sidebar() {
       <div className="fixed-width-col">
         <div className="sidebar-brand">
           <div className="sidebar-brand-icon">
-            <img src="/favicon.svg" alt="KnowledgeOS" width={22} height={22} />
+            <img src="/favicon.svg" alt="KnowlegeOS" width={22} height={22} />
           </div>
           <div className="sidebar-brand-text">
             <span className="font-bold text-base leading-tight tracking-tight text-foreground flex items-center gap-1.5">
-              Knowledge<span className="text-accent">OS</span>
+              Knowlege<span className="text-accent">OS</span>
             </span>
             <span className="text-[10px] uppercase font-mono tracking-wider text-muted-foreground">
               Adaptive Study

@@ -68,7 +68,7 @@ function VideoCard({ video }: { video: VideoItem }) {
         )}
         {video.timestamp_label && (
           <p className="mt-1 text-[11px] font-medium text-accent">
-            Starts at {video.timestamp_label} — caption match
+            Starts at {video.timestamp_label} — {video.seek_confidence === "high" ? "strong" : "relevant"} caption match
           </p>
         )}
       </div>

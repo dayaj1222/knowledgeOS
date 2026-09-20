@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
+  USER_ID,
   createStudyLog,
   sendChatStream,
   submitChatQuiz,
@@ -34,6 +35,11 @@ export interface ActiveTimer {
   topicName: string;
   label: string;
   startedAt: number;
+}
+
+export interface ReplyTarget {
+  source: "user" | "tutor";
+  text: string;
 }
 
 function readTimer(): ActiveTimer | null {
@@ -174,7 +180,7 @@ export function useChatThread() {
   }, [threadQuery.error, activeConversationId]);
 
   const send = useCallback(
-    async (text: string, image?: string | null) => {
+    async (text: string, image?: string | null, replyTarget?: ReplyTarget) => {
       const msg = text.trim();
       if ((!msg && !image) || busy) return;
       setBusy(true);
@@ -189,6 +195,7 @@ export function useChatThread() {
         course_id: selectedCourseId,
         course_name: selectedCourse?.name ?? null,
         module_id: activeConvo?.module_id ?? pendingPin?.id ?? null,
+        ...(replyTarget ? { reply_target: replyTarget } : {}),
       };
       const userMsg: ChatMessage = {
         id: -Date.now(), role: "user",
@@ -312,6 +319,10 @@ export function useChatThread() {
         // Thread changed server-side (cards persisted) — revalidate in background.
         queryClient.invalidateQueries({ queryKey: ["thread", turn.conversation_id] });
         queryClient.invalidateQueries({ queryKey: ["conversations"] });
+        // Tutor tools can record demonstrated understanding during any turn.
+        // Proficiency is shared with the Library topic bars, so revalidate it
+        // here rather than leaving that screen stale until a page reload.
+        queryClient.invalidateQueries({ queryKey: ["proficiency", USER_ID] });
       } catch (e) {
         const detail = (e as Error).message;
         notifyError(detail);
